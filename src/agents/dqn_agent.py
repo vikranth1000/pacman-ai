@@ -91,9 +91,10 @@ class DQNAgent(BaseAgent):
         # Current Q-values for chosen actions
         current_q = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
 
-        # Target Q-values
+        # Double DQN: online network selects best action, target network evaluates it
         with torch.no_grad():
-            next_q = self.target_network(next_states).max(1)[0]
+            best_actions = self.q_network(next_states).argmax(1)
+            next_q = self.target_network(next_states).gather(1, best_actions.unsqueeze(1)).squeeze(1)
             target_q = rewards + self.gamma * next_q * (~dones).float()
 
         loss = self.loss_fn(current_q, target_q)

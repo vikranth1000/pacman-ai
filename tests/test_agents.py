@@ -55,8 +55,9 @@ class TestDQNAgent:
         assert result is None
 
     def test_learn_returns_loss_with_data(self, agent):
-        # Fill buffer past minimum
-        for _ in range(1100):
+        # Fill buffer past minimum (must exceed max(min_replay, batch_size))
+        needed = max(agent.min_replay, agent.batch_size) + 100
+        for _ in range(needed):
             s = np.random.randn(50).astype(np.float32)
             ns = np.random.randn(50).astype(np.float32)
             agent.replay_buffer.push(s, np.random.randint(4), np.random.randn(), ns, False)

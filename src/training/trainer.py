@@ -141,6 +141,13 @@ class Trainer:
         step_result = {"done": False}
         action_counts = {name: 0 for name in self.agents}
 
+        # Anti-oscillation tracking for Pac-Man
+        visited_tiles = set()
+        recent_positions = []
+        revisit_window = 20
+        revisit_penalty = pac_rewards.get("revisit_penalty", 0.3)
+        new_tile_bonus = pac_rewards.get("new_tile_bonus", 0.1)
+
         while not self.game.done:
             # Get observations
             pac_obs = build_pacman_observation(self.game)
@@ -165,6 +172,17 @@ class Trainer:
             # Compute rewards
             pac_reward = self._compute_pacman_reward(step_result, pac_rewards)
             ghost_reward_list = self._compute_ghost_rewards(step_result, ghost_rewards)
+
+            # Anti-oscillation: reward exploration, penalize revisiting
+            pac_pos = (self.game.pacman.row, self.game.pacman.col)
+            if pac_pos not in visited_tiles:
+                pac_reward += new_tile_bonus
+                visited_tiles.add(pac_pos)
+            window = recent_positions[-revisit_window:]
+            revisit_count = window.count(pac_pos)
+            if revisit_count > 0:
+                pac_reward -= revisit_penalty * revisit_count
+            recent_positions.append(pac_pos)
 
             # Get next observations
             next_pac_obs = build_pacman_observation(self.game)
