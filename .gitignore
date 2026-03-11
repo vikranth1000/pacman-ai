@@ -1,0 +1,15 @@
+.superpowers/
+runs/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.db
+*.mov
+*.mp4
+*.avi
