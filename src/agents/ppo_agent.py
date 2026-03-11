@@ -50,23 +50,31 @@ class PPOAgent(BaseAgent):
         self.episode_reward = 0.0
         self.avg_q_value = 0.0  # stores avg value estimate for compatibility
 
+    def _build_action_mask(self, legal_actions: list[int]) -> np.ndarray:
+        """Build action mask: 0.0 for legal actions, -inf for illegal."""
+        mask = np.full(4, float('-inf'), dtype=np.float32)
+        for a in legal_actions:
+            mask[a] = 0.0
+        return mask
+
     def act(self, state: np.ndarray, legal_actions: list[int], training: bool = True) -> int:
         """Select action using policy with action masking."""
         if not legal_actions:
+            self._last_action_mask = np.zeros(4, dtype=np.float32)
             return 0
+
+        action_mask = self._build_action_mask(legal_actions)
+        self._last_action_mask = action_mask
+        mask_t = torch.from_numpy(action_mask).to(self.device)
 
         # Epsilon-greedy exploration on top of policy
         if training and np.random.random() < self.epsilon:
             action = np.random.choice(legal_actions)
-            # Still need log_prob and value for the rollout buffer
             with torch.no_grad():
                 state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
                 logits, value = self.network(state_t)
-                # Apply action mask
-                mask = torch.full((4,), float('-inf'), device=self.device)
-                for a in legal_actions:
-                    mask[a] = 0.0
-                logits = logits.squeeze(0) + mask
+                logits = logits.squeeze(0) + mask_t
+                logits = torch.clamp(logits, min=-50.0, max=50.0)
                 dist = torch.distributions.Categorical(logits=logits)
                 log_prob = dist.log_prob(torch.tensor(action, device=self.device)).item()
                 self.avg_q_value = value.item()
@@ -77,12 +85,8 @@ class PPOAgent(BaseAgent):
         with torch.no_grad():
             state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             logits, value = self.network(state_t)
-
-            # Action masking
-            mask = torch.full((4,), float('-inf'), device=self.device)
-            for a in legal_actions:
-                mask[a] = 0.0
-            logits = logits.squeeze(0) + mask
+            logits = logits.squeeze(0) + mask_t
+            logits = torch.clamp(logits, min=-50.0, max=50.0)
 
             dist = torch.distributions.Categorical(logits=logits)
             action = dist.sample()
@@ -103,6 +107,7 @@ class PPOAgent(BaseAgent):
             reward,
             self._last_value,
             done,
+            action_mask=self._last_action_mask,
         )
         self.episode_reward += reward
 
@@ -122,21 +127,29 @@ class PPOAgent(BaseAgent):
         num_updates = 0
 
         for _ in range(self.ppo_epochs):
-            for states, actions, old_log_probs, returns, advantages in \
+            for states, actions, old_log_probs, returns, advantages, action_masks in \
                     self.rollout.get_batches(self.minibatch_size, self.device):
 
                 # Normalize advantages
                 if len(advantages) > 1:
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-                # Forward pass
+                # Forward pass with action masking
                 logits, values = self.network(states)
+                logits = logits + action_masks  # apply stored masks (-inf for illegal)
+                logits = torch.clamp(logits, min=-50.0, max=50.0)
+
+                # Check for NaN and skip batch if detected
+                if torch.isnan(logits).any():
+                    continue
+
                 dist = torch.distributions.Categorical(logits=logits)
                 new_log_probs = dist.log_prob(actions)
                 entropy = dist.entropy().mean()
 
-                # Policy loss (clipped surrogate)
+                # Policy loss (clipped surrogate) with ratio clamping for stability
                 ratio = (new_log_probs - old_log_probs).exp()
+                ratio = torch.clamp(ratio, 0.01, 100.0)
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
@@ -146,6 +159,9 @@ class PPOAgent(BaseAgent):
 
                 # Total loss
                 loss = policy_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    continue
 
                 self.optimizer.zero_grad()
                 loss.backward()
