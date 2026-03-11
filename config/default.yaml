@@ -17,9 +17,10 @@ game:
   # Ghost house exit pellet thresholds (Blinky starts outside)
   ghost_exit_pellets: [0, 30, 60, 80]
 
-# DQN agent hyperparameters
+# DQN/PPO agent hyperparameters
 agent:
-  learning_rate: 0.0002
+  algorithm: ppo  # "dqn" or "ppo"
+  learning_rate: 0.0003
   batch_size: 128
   gamma: 0.95
   epsilon_start: 1.0
@@ -31,6 +32,33 @@ agent:
   learn_every_n_steps: 4
   gradient_clip_norm: 1.0
   hidden_sizes: [256, 256, 128]
+
+  # Prioritized Experience Replay (DQN only)
+  use_prioritized_replay: true
+  per_alpha: 0.6
+  per_beta_start: 0.4
+  per_beta_end: 1.0
+  per_beta_anneal_episodes: 2500
+
+  # PPO-specific
+  ppo_clip_epsilon: 0.2
+  ppo_epochs: 4
+  ppo_minibatch_size: 64
+  ppo_value_loss_coef: 0.5
+  ppo_entropy_coef: 0.01
+  ppo_gae_lambda: 0.95
+  ppo_max_grad_norm: 0.5
+
+# Curriculum learning — asymmetric ghost/pacman training
+curriculum:
+  enabled: true
+  ghost_epsilon_start: 1.0
+  ghost_epsilon_end: 0.12
+  ghost_epsilon_decay_episodes: 3000
+  ghost_lr_multiplier_start: 0.3
+  ghost_lr_multiplier_end: 1.0
+  ghost_lr_ramp_episodes: 2000
+  pacman_head_start_episodes: 300
 
 # Reward values
 rewards:

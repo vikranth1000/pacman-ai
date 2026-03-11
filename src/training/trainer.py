@@ -7,15 +7,17 @@ from datetime import datetime
 from src.engine.game import GameState
 from src.engine.constants import GhostID, GHOST_NAMES
 from src.agents.dqn_agent import DQNAgent
+from src.agents.ppo_agent import PPOAgent
 from src.agents.observations import build_pacman_observation, build_ghost_observation, get_observation_sizes
 from src.training.checkpoint import save_checkpoint, load_checkpoint
+from src.training.curriculum import CurriculumScheduler
 from src.data.logger import DataLogger
 from src.utils.config import save_config
 from src.utils.seeding import set_seeds, get_device
 
 
 class Trainer:
-    """Orchestrates continuous self-play training."""
+    """Orchestrates continuous self-play training with curriculum learning."""
 
     def __init__(self, config: dict, run_dir: Path | None = None, resume: bool = False):
         self.config = config
@@ -43,12 +45,23 @@ class Trainer:
         pac_obs_size, ghost_obs_size = get_observation_sizes(config)
         print(f"Observation sizes — Pac-Man: {pac_obs_size}, Ghost: {ghost_obs_size}")
 
+        # Determine algorithm
+        agent_cfg = config.get("agent", {})
+        self.algorithm = agent_cfg.get("algorithm", "dqn")
+        print(f"Algorithm: {self.algorithm.upper()}")
+
         # Create agents
-        self.agents: dict[str, DQNAgent] = {}
-        self.agents["pacman"] = DQNAgent("pacman", pac_obs_size, config, self.device)
+        AgentClass = PPOAgent if self.algorithm == "ppo" else DQNAgent
+        self.agents: dict[str, DQNAgent | PPOAgent] = {}
+        self.agents["pacman"] = AgentClass("pacman", pac_obs_size, config, self.device)
         for ghost_id in GhostID:
             name = GHOST_NAMES[ghost_id]
-            self.agents[name] = DQNAgent(name, ghost_obs_size, config, self.device)
+            self.agents[name] = AgentClass(name, ghost_obs_size, config, self.device)
+
+        # Curriculum scheduler
+        self.curriculum = CurriculumScheduler(config)
+        if self.curriculum.enabled:
+            print("Curriculum learning: ENABLED")
 
         # Logger
         self.logger = DataLogger(self.run_dir / "metrics.db")
@@ -58,6 +71,7 @@ class Trainer:
         self.start_episode = 0
         self.reward_cfg = config.get("rewards", {})
         self.train_cfg = config.get("training", {})
+        self.ghost_names = [GHOST_NAMES[GhostID(i)] for i in range(4)]
 
         # Resume from checkpoint if requested
         if resume:
@@ -69,13 +83,7 @@ class Trainer:
                 print("No checkpoint found, starting fresh")
 
     def train(self, num_episodes: int | None = None, callback=None):
-        """Run training loop.
-
-        Args:
-            num_episodes: Override config num_episodes if provided.
-            callback: Optional function called each episode with (episode, step_result, agents).
-                      If callback returns False, training stops.
-        """
+        """Run training loop."""
         if num_episodes is None:
             num_episodes = self.train_cfg.get("num_episodes", 5000)
 
@@ -92,10 +100,32 @@ class Trainer:
             self.game.reset()
             for agent in self.agents.values():
                 agent.reset_episode_stats()
-                agent.update_epsilon(episode)
+
+            # Curriculum: set per-agent epsilon and ghost learning rate
+            if self.curriculum.enabled:
+                pac_eps = self.curriculum.get_pacman_epsilon(episode)
+                ghost_eps = self.curriculum.get_ghost_epsilon(episode)
+                ghost_lr = self.curriculum.get_ghost_learning_rate(episode)
+
+                self.agents["pacman"].set_epsilon(pac_eps)
+                for gname in self.ghost_names:
+                    self.agents[gname].set_epsilon(ghost_eps)
+                    self.agents[gname].set_learning_rate(ghost_lr)
+            else:
+                for agent in self.agents.values():
+                    agent.update_epsilon(episode)
+
+            # Update PER beta (if applicable)
+            for agent in self.agents.values():
+                if hasattr(agent, 'update_beta'):
+                    agent.update_beta(episode)
 
             # Run episode
             step_result = self._run_episode(training=True)
+
+            # End-of-episode learning (PPO does its update here)
+            for agent in self.agents.values():
+                agent.end_episode()
 
             # Log metrics
             self._log_episode(episode, step_result)
@@ -110,13 +140,15 @@ class Trainer:
                 elapsed = time.time() - total_start
                 eps_per_sec = (episode - self.start_episode + 1) / elapsed
                 win_rates = self.logger.get_win_rates(window=100)
+                pac_eps = self.agents["pacman"].epsilon
+                ghost_eps = self.agents[self.ghost_names[0]].epsilon
                 print(
                     f"Episode {episode + 1} | "
                     f"Score: {step_result['score']:>5} | "
                     f"Steps: {step_result['step']:>4} | "
                     f"Winner: {step_result['winner']:>6} | "
-                    f"ε: {self.agents['pacman'].epsilon:.3f} | "
-                    f"Pac-Man WR: {win_rates['pacman']:.1%} | "
+                    f"ε_pac: {pac_eps:.3f} ε_ghost: {ghost_eps:.3f} | "
+                    f"Pac WR: {win_rates['pacman']:.1%} | "
                     f"Ghost WR: {win_rates['ghosts']:.1%} | "
                     f"{eps_per_sec:.1f} ep/s"
                 )
@@ -159,12 +191,11 @@ class Trainer:
             action_counts["pacman"] += 1
 
             ghost_actions = []
-            ghost_names = [GHOST_NAMES[GhostID(i)] for i in range(4)]
             for i in range(4):
                 legal = self.game.get_legal_actions_ghost(i)
-                action = self.agents[ghost_names[i]].act(ghost_obs[i], legal, training)
+                action = self.agents[self.ghost_names[i]].act(ghost_obs[i], legal, training)
                 ghost_actions.append(action)
-                action_counts[ghost_names[i]] += 1
+                action_counts[self.ghost_names[i]] += 1
 
             # Step game
             step_result = self.game.step(pac_action, ghost_actions)
@@ -195,7 +226,7 @@ class Trainer:
                 self.agents["pacman"].learn()
 
             for i in range(4):
-                name = ghost_names[i]
+                name = self.ghost_names[i]
                 self.agents[name].store_transition(
                     ghost_obs[i], ghost_actions[i], ghost_reward_list[i], next_ghost_obs[i], done
                 )
@@ -209,7 +240,7 @@ class Trainer:
         """Compute Pac-Man's reward from step events."""
         reward = reward_cfg.get("time_step", -0.01)
 
-        # Pellet proximity shaping: reward for being close to nearest pellet
+        # Pellet proximity shaping
         nearest = self.game.maze.find_nearest_pellet(self.game.pacman.row, self.game.pacman.col)
         if nearest is not None:
             dist = abs(nearest[0] - self.game.pacman.row) + abs(nearest[1] - self.game.pacman.col)
@@ -254,7 +285,6 @@ class Trainer:
                 for i in range(4):
                     rewards[i] += reward_cfg.get("pacman_clears_level", -15.0)
             elif event.startswith("caught_by_"):
-                # Find which ghost caught Pac-Man
                 ghost_name = event.replace("caught_by_", "")
                 for i in range(4):
                     name = GHOST_NAMES[GhostID(i)]

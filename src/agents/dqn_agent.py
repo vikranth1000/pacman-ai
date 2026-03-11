@@ -1,18 +1,20 @@
-"""DQN Agent with target network, experience replay, and epsilon-greedy exploration."""
+"""DQN Agent with Double DQN, optional PER, and curriculum-compatible controls."""
 
 import random
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 from src.agents.base_agent import BaseAgent
 from src.agents.networks import QNetwork
 from src.agents.replay_buffer import ReplayBuffer
+from src.agents.prioritized_replay_buffer import PrioritizedReplayBuffer
 
 
 class DQNAgent(BaseAgent):
-    """Independent DQN agent. Each Pac-Man/Ghost gets its own instance."""
+    """Independent DQN agent with Double DQN and optional Prioritized Replay."""
 
     def __init__(self, name: str, input_size: int, config: dict, device: torch.device):
         self.name = name
@@ -41,11 +43,20 @@ class DQNAgent(BaseAgent):
         # Optimizer and loss
         lr = agent_cfg.get("learning_rate", 3e-4)
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
-        self.loss_fn = nn.SmoothL1Loss()  # Huber loss
 
-        # Replay buffer
+        # Replay buffer (prioritized or uniform)
         buffer_size = agent_cfg.get("replay_buffer_size", 100000)
-        self.replay_buffer = ReplayBuffer(capacity=buffer_size)
+        self.use_per = agent_cfg.get("use_prioritized_replay", False)
+        if self.use_per:
+            self.replay_buffer = PrioritizedReplayBuffer(
+                capacity=buffer_size,
+                alpha=agent_cfg.get("per_alpha", 0.6),
+                beta_start=agent_cfg.get("per_beta_start", 0.4),
+                beta_end=agent_cfg.get("per_beta_end", 1.0),
+                beta_anneal_episodes=agent_cfg.get("per_beta_anneal_episodes", 2500),
+            )
+        else:
+            self.replay_buffer = ReplayBuffer(capacity=buffer_size)
 
         # Tracking
         self.step_count = 0
@@ -84,9 +95,13 @@ class DQNAgent(BaseAgent):
         if self.step_count % self.learn_every != 0:
             return self.last_loss
 
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(
-            self.batch_size, self.device
-        )
+        if self.use_per:
+            states, actions, rewards, next_states, dones, indices, weights = \
+                self.replay_buffer.sample(self.batch_size, self.device)
+        else:
+            states, actions, rewards, next_states, dones = \
+                self.replay_buffer.sample(self.batch_size, self.device)
+            weights = None
 
         # Current Q-values for chosen actions
         current_q = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
@@ -97,12 +112,23 @@ class DQNAgent(BaseAgent):
             next_q = self.target_network(next_states).gather(1, best_actions.unsqueeze(1)).squeeze(1)
             target_q = rewards + self.gamma * next_q * (~dones).float()
 
-        loss = self.loss_fn(current_q, target_q)
+        # Element-wise loss for PER priority updates
+        td_errors = current_q - target_q
+        element_loss = F.smooth_l1_loss(current_q, target_q, reduction='none')
+
+        if weights is not None:
+            loss = (element_loss * weights).mean()
+        else:
+            loss = element_loss.mean()
 
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.q_network.parameters(), self.grad_clip)
         self.optimizer.step()
+
+        # Update priorities for PER
+        if self.use_per:
+            self.replay_buffer.update_priorities(indices, td_errors.detach().abs().cpu().numpy())
 
         # Soft update target network
         self._soft_update_target()
@@ -120,6 +146,10 @@ class DQNAgent(BaseAgent):
         self.replay_buffer.push(state, action, reward, next_state, done)
         self.episode_reward += reward
 
+    def end_episode(self) -> float | None:
+        """No-op for DQN (learns continuously). Called for API compatibility."""
+        return None
+
     def update_epsilon(self, episode: int):
         """Linear epsilon decay."""
         if episode >= self.epsilon_decay_episodes:
@@ -127,6 +157,20 @@ class DQNAgent(BaseAgent):
         else:
             fraction = episode / self.epsilon_decay_episodes
             self.epsilon = self.epsilon_start + fraction * (self.epsilon_end - self.epsilon_start)
+
+    def set_epsilon(self, value: float):
+        """Set epsilon directly (used by curriculum scheduler)."""
+        self.epsilon = value
+
+    def set_learning_rate(self, lr: float):
+        """Set learning rate directly (used by curriculum scheduler)."""
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = lr
+
+    def update_beta(self, episode: int):
+        """Update PER beta if using prioritized replay."""
+        if self.use_per:
+            self.replay_buffer.update_beta(episode)
 
     def reset_episode_stats(self):
         """Reset per-episode tracking."""

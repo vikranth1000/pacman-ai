@@ -23,6 +23,10 @@ class BaseAgent(ABC):
         """Store a transition in the replay buffer."""
         ...
 
+    def end_episode(self) -> float | None:
+        """Called at end of episode. PPO uses this for batch updates. DQN no-ops."""
+        return None
+
     @abstractmethod
     def save(self, path: str):
         """Save agent state to disk."""
