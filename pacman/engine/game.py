@@ -315,11 +315,20 @@ def _update_mode_timers(state: GameState, config: dict) -> None:
 
 
 def _update_ghost_house(state: GameState, config: dict) -> None:
-    """Check if ghosts should exit the house based on pellets eaten."""
-    thresholds = config["game"]["ghost_exit_pellets"]
+    """Check if ghosts should exit the house based on pellets eaten OR time.
+
+    Ghosts exit when EITHER condition is met (whichever comes first):
+    - Enough pellets have been eaten (pellet threshold)
+    - Enough game steps have passed (timer threshold)
+    This ensures ghosts always enter the game even if the agent isn't eating.
+    """
+    pellet_thresholds = config["game"]["ghost_exit_pellets"]
+    timer_thresholds = config["game"].get("ghost_exit_timer", [0, 0, 0, 0])
     for i in range(NUM_GHOSTS):
         if state.ghost_in_house[i] and not state.ghost_exiting[i]:
-            if state.pellets_eaten >= thresholds[i]:
+            by_pellets = state.pellets_eaten >= pellet_thresholds[i]
+            by_timer = state.step_count >= timer_thresholds[i]
+            if by_pellets or by_timer:
                 state.ghost_exiting[i] = True
 
 
