@@ -50,7 +50,6 @@ rewards:
   death: -10.0
   game_over: -25.0
   time_step: -0.01
-  reversal: -0.1
 
 training:
   total_updates: 5000

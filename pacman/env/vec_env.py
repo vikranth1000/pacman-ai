@@ -76,10 +76,17 @@ class VecEnv:
         return obs, rewards, dones, infos
 
     def get_legal_masks(self) -> np.ndarray:
-        """Return (N, 4) bool mask of legal actions per env."""
+        """Return (N, 4) bool mask of legal actions per env.
+
+        Masks the reverse direction (arcade-style no-reverse) to prevent
+        oscillation. The reverse is only allowed if it's the sole legal move.
+        """
         masks = np.zeros((self.num_envs, NUM_ACTIONS), dtype=bool)
         for i in range(self.num_envs):
-            masks[i] = get_legal_actions(self._states[i].grid, self._states[i].pac_pos)
+            masks[i] = get_legal_actions(
+                self._states[i].grid, self._states[i].pac_pos,
+                prev_dir=int(self._states[i].pac_dir),
+            )
         return masks
 
     def set_difficulty(self, difficulty: int) -> None:

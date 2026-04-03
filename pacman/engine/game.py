@@ -14,14 +14,28 @@ from .entities import GameState, reset_positions
 from . import ghost_ai
 
 
-def get_legal_actions(grid: np.ndarray, pac_pos: np.ndarray) -> np.ndarray:
-    """Return (4,) bool mask of legal Pac-Man moves."""
+def get_legal_actions(
+    grid: np.ndarray, pac_pos: np.ndarray, prev_dir: int = -1,
+) -> np.ndarray:
+    """Return (4,) bool mask of legal Pac-Man moves.
+
+    If prev_dir is provided, the reverse direction is masked out (arcade-style
+    no-reverse constraint). This eliminates oscillation by making it physically
+    impossible to go backward — unless reversing is the only legal move.
+    """
     row, col = int(pac_pos[0]), int(pac_pos[1])
     mask = np.zeros(4, dtype=bool)
     for d in Direction:
         dr, dc = DIRECTION_DELTAS[d]
         nr, nc = row + dr, (col + dc) % MAZE_COLS
         mask[d] = is_walkable(grid, nr, nc, for_ghost=False)
+
+    # Mask the reverse direction unless it's the only legal move
+    if prev_dir >= 0:
+        reverse = OPPOSITE_DIRECTION[Direction(prev_dir)]
+        if mask.sum() > 1 and mask[reverse]:
+            mask[reverse] = False
+
     return mask
 
 
@@ -38,10 +52,6 @@ def step_game(
     """
     events = []
     state.step_count += 1
-
-    # --- 0. Detect direction reversal before moving ---
-    if pac_action == OPPOSITE_DIRECTION.get(Direction(state.pac_dir), -1):
-        events.append("reversal")
 
     # --- 1. Move Pac-Man ---
     _move_pacman(state, pac_action)
@@ -351,7 +361,5 @@ def compute_reward(events: list[str], config: dict, state: GameState) -> float:
             reward += reward_cfg["death"]
         elif event == "game_over":
             reward += reward_cfg["game_over"]
-        elif event == "reversal":
-            reward += reward_cfg.get("reversal", 0.0)
 
     return reward

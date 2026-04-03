@@ -50,7 +50,10 @@ class PacmanEnv:
         return obs, reward, terminated, truncated, info
 
     def get_legal_mask(self) -> np.ndarray:
-        return get_legal_actions(self._state.grid, self._state.pac_pos)
+        return get_legal_actions(
+            self._state.grid, self._state.pac_pos,
+            prev_dir=int(self._state.pac_dir),
+        )
 
     @property
     def state(self) -> GameState:
