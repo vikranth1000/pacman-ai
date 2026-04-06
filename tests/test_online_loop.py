@@ -171,3 +171,50 @@ class TestWMTrainerFineTune:
 
         # 3. Run a few training steps — should not error
         trainer2.train(total_steps=2, log_every=1, save_every=2, save_dir=save_dir)
+
+
+class TestOnlineLoopIntegration:
+    def test_one_iteration_runs_without_error(self, config, tmp_path):
+        """Run 1 iteration of the online loop with tiny params — smoke test."""
+        device = torch.device("cpu")
+
+        # 1. Create initial world model and save it
+        wm = WorldModel().to(device)
+        wm_dir = tmp_path / "world_model"
+        wm_dir.mkdir()
+        torch.save(
+            {"model_state_dict": wm.state_dict(), "step": 0},
+            wm_dir / "world_model_latest.pt",
+        )
+
+        # 2. Create a tiny replay buffer and save it
+        buf = _make_small_buffer(config, num_episodes=5, steps_per_ep=30)
+        buf_path = tmp_path / "replay_buffer.pt"
+        buf.save(str(buf_path))
+
+        # 3. Import and run one iteration
+        from scripts.train_online import run_online_loop
+
+        result = run_online_loop(
+            wm_checkpoint=wm_dir / "world_model_latest.pt",
+            buffer_path=buf_path,
+            config=config,
+            device=device,
+            max_iterations=1,
+            dream_updates=10,
+            dream_eval_every=5,
+            dream_eval_episodes=2,
+            dream_patience=100,
+            dream_horizon=3,
+            dream_imaginations=4,
+            dream_lr=1e-3,
+            collect_episodes=3,
+            wm_fine_tune_steps=5,
+            wm_lr=1e-4,
+            save_dir=tmp_path / "online_run",
+        )
+
+        assert isinstance(result, dict)
+        assert "iterations_completed" in result
+        assert "best_score" in result
+        assert result["iterations_completed"] == 1
