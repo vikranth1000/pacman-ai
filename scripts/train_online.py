@@ -68,10 +68,12 @@ def run_online_loop(
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load replay buffer
+    # Load replay buffer — reset capacity to 10K since load() restores the
+    # original max_episodes from the saved file (likely 1000 from PPO collection).
     print(f"Loading replay buffer from {buffer_path} ...")
     buffer = EpisodeReplayBuffer(max_episodes=10_000)
     buffer.load(str(buffer_path))
+    buffer._max_episodes = 10_000
     print(f"  Episodes: {len(buffer)} | Steps: {buffer.total_steps}")
 
     current_wm_path = wm_checkpoint
@@ -82,115 +84,119 @@ def run_online_loop(
     iterations_completed = 0
     loop_start = time.time()
 
-    for iteration in range(max_iterations):
-        iter_start = time.time()
-        iter_dir = save_dir / f"iter_{iteration}"
-        print(f"\n{'='*60}")
-        print(f"  ITERATION {iteration}")
-        print(f"{'='*60}")
+    try:
+        for iteration in range(max_iterations):
+            iter_start = time.time()
+            iter_dir = save_dir / f"iter_{iteration}"
+            print(f"\n{'='*60}")
+            print(f"  ITERATION {iteration}")
+            print(f"{'='*60}")
 
-        # --- Phase 1: Train dream agent ---
-        print(f"\n[Phase 1] Training dream agent (max {dream_updates} updates)...")
-        wm = WorldModel().to(device)
-        ckpt = torch.load(current_wm_path, map_location=device, weights_only=True)
-        wm.load_state_dict(ckpt["model_state_dict"])
-        print(f"  Loaded WM from {current_wm_path}")
+            # --- Phase 1: Train dream agent ---
+            print(f"\n[Phase 1] Training dream agent (max {dream_updates} updates)...")
+            wm = WorldModel().to(device)
+            ckpt = torch.load(current_wm_path, map_location=device, weights_only=True)
+            wm.load_state_dict(ckpt["model_state_dict"])
+            print(f"  Loaded WM from {current_wm_path}")
 
-        dream_save_dir = iter_dir / "dream_agent"
-        trainer = DreamTrainer(
-            world_model=wm,
-            config=config,
-            device=device,
-            imagination_horizon=dream_horizon,
-            num_imaginations=dream_imaginations,
-            lr=dream_lr,
-        )
-        dream_result = trainer.train(
-            total_updates=dream_updates,
-            eval_every=dream_eval_every,
-            eval_episodes=dream_eval_episodes,
-            save_dir=dream_save_dir,
-            patience=dream_patience,
-        )
-
-        iter_best = dream_result["best_score"]
-        print(f"\n  Iteration {iteration} best score: {iter_best:.1f}")
-
-        # Track overall best
-        if iter_best > overall_best_score:
-            overall_best_score = iter_best
-            overall_best_iteration = iteration
-            overall_best_agent_path = dream_result["best_path"]
-
-        iterations_completed = iteration + 1
-
-        # Convergence check after Phase 1: no point collecting data and fine-tuning
-        # the WM with a worse agent — exit early to save hours of compute.
-        if iteration > 0 and iter_best <= prev_best:
-            print(
-                f"\n  Converged: iteration {iteration} ({iter_best:.1f}) "
-                f"did not beat iteration {iteration - 1} ({prev_best:.1f})"
+            dream_save_dir = iter_dir / "dream_agent"
+            trainer = DreamTrainer(
+                world_model=wm,
+                config=config,
+                device=device,
+                imagination_horizon=dream_horizon,
+                num_imaginations=dream_imaginations,
+                lr=dream_lr,
             )
-            break
-        prev_best = iter_best
-
-        # --- Phase 2: Collect data with dream agent ---
-        print(f"\n[Phase 2] Collecting {collect_episodes} episodes with dream agent...")
-        wm.eval()
-        for p in wm.parameters():
-            p.requires_grad_(False)
-
-        policy = DreamPolicy(latent_dim=wm.rssm.latent_dim).to(device)
-        da_ckpt = torch.load(
-            dream_result["best_path"], map_location=device, weights_only=True
-        )
-        policy.load_state_dict(da_ckpt["policy_state_dict"])
-
-        new_buffer = collect_dream_episodes(
-            world_model=wm,
-            policy=policy,
-            config=config,
-            device=device,
-            num_episodes=collect_episodes,
-        )
-
-        # Merge into main buffer
-        for ep in new_buffer._episodes:
-            buffer.add_episode(ep)
-        print(f"  Buffer now: {len(buffer)} episodes, {buffer.total_steps} steps")
-
-        # Save expanded buffer
-        expanded_buf_path = save_dir / f"replay_buffer_iter{iteration}.pt"
-        buffer.save(str(expanded_buf_path))
-        print(f"  Saved buffer to {expanded_buf_path}")
-
-        # --- Phase 3: Fine-tune world model ---
-        print(f"\n[Phase 3] Fine-tuning world model ({wm_fine_tune_steps} steps, lr={wm_lr})...")
-        wm_ft, ft_trainer = WMTrainer.fine_tune(
-            checkpoint_path=current_wm_path,
-            replay_buffer=buffer,
-            device=device,
-            lr=wm_lr,
-        )
-
-        wm_save_dir = iter_dir / "world_model"
-        ft_trainer.train(
-            total_steps=wm_fine_tune_steps,
-            log_every=100,
-            save_every=5000,
-            save_dir=wm_save_dir,
-        )
-
-        # Update current WM path for next iteration
-        current_wm_path = wm_save_dir / "world_model_latest.pt"
-        if not current_wm_path.exists():
-            raise RuntimeError(
-                f"Fine-tuned WM checkpoint not found at {current_wm_path}. "
-                f"WMTrainer.train() may not have saved (steps={wm_fine_tune_steps})."
+            dream_result = trainer.train(
+                total_updates=dream_updates,
+                eval_every=dream_eval_every,
+                eval_episodes=dream_eval_episodes,
+                save_dir=dream_save_dir,
+                patience=dream_patience,
             )
 
-        iter_elapsed = time.time() - iter_start
-        print(f"\n  Iteration {iteration} complete in {iter_elapsed / 60:.1f} min")
+            iter_best = dream_result["best_score"]
+            print(f"\n  Iteration {iteration} best score: {iter_best:.1f}")
+
+            # Track overall best
+            if iter_best > overall_best_score:
+                overall_best_score = iter_best
+                overall_best_iteration = iteration
+                overall_best_agent_path = dream_result["best_path"]
+
+            iterations_completed = iteration + 1
+
+            # Convergence check after Phase 1: no point collecting data and
+            # fine-tuning the WM with a worse agent — exit early to save hours.
+            if iteration > 0 and iter_best <= prev_best:
+                print(
+                    f"\n  Converged: iteration {iteration} ({iter_best:.1f}) "
+                    f"did not beat iteration {iteration - 1} ({prev_best:.1f})"
+                )
+                break
+            prev_best = iter_best
+
+            # --- Phase 2: Collect data with dream agent ---
+            print(f"\n[Phase 2] Collecting {collect_episodes} episodes with dream agent...")
+            wm.eval()
+            for p in wm.parameters():
+                p.requires_grad_(False)
+
+            policy = DreamPolicy(latent_dim=wm.rssm.latent_dim).to(device)
+            da_ckpt = torch.load(
+                dream_result["best_path"], map_location=device, weights_only=True
+            )
+            policy.load_state_dict(da_ckpt["policy_state_dict"])
+
+            new_buffer = collect_dream_episodes(
+                world_model=wm,
+                policy=policy,
+                config=config,
+                device=device,
+                num_episodes=collect_episodes,
+            )
+
+            # Merge into main buffer
+            for ep in new_buffer._episodes:
+                buffer.add_episode(ep)
+            print(f"  Buffer now: {len(buffer)} episodes, {buffer.total_steps} steps")
+
+            # Save expanded buffer
+            expanded_buf_path = save_dir / f"replay_buffer_iter{iteration}.pt"
+            buffer.save(str(expanded_buf_path))
+            print(f"  Saved buffer to {expanded_buf_path}")
+
+            # --- Phase 3: Fine-tune world model ---
+            print(f"\n[Phase 3] Fine-tuning world model ({wm_fine_tune_steps} steps, lr={wm_lr})...")
+            wm_ft, ft_trainer = WMTrainer.fine_tune(
+                checkpoint_path=current_wm_path,
+                replay_buffer=buffer,
+                device=device,
+                lr=wm_lr,
+            )
+
+            wm_save_dir = iter_dir / "world_model"
+            ft_trainer.train(
+                total_steps=wm_fine_tune_steps,
+                log_every=100,
+                save_every=5000,
+                save_dir=wm_save_dir,
+            )
+
+            # Update current WM path for next iteration
+            current_wm_path = wm_save_dir / "world_model_latest.pt"
+            if not current_wm_path.exists():
+                raise RuntimeError(
+                    f"Fine-tuned WM checkpoint not found at {current_wm_path}. "
+                    f"WMTrainer.train() may not have saved (steps={wm_fine_tune_steps})."
+                )
+
+            iter_elapsed = time.time() - iter_start
+            print(f"\n  Iteration {iteration} complete in {iter_elapsed / 60:.1f} min")
+
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user. Saving current best...")
 
     total_elapsed = time.time() - loop_start
     print(f"\n{'='*60}")
