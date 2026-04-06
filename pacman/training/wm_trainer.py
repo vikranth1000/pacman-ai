@@ -123,3 +123,55 @@ class WMTrainer:
         torch.save(state, save_dir / "world_model_latest.pt")
         torch.save(state, save_dir / f"world_model_{step}.pt")
         print(f"  Saved checkpoint at step {step}.")
+
+    @classmethod
+    def fine_tune(
+        cls,
+        checkpoint_path: str | Path,
+        replay_buffer: EpisodeReplayBuffer,
+        device: torch.device,
+        lr: float = 1e-4,
+        grad_clip: float = 100.0,
+        seq_len: int = 50,
+        batch_size: int = 16,
+    ) -> tuple[WorldModel, "WMTrainer"]:
+        """Create a WMTrainer from an existing checkpoint for fine-tuning.
+
+        Loads both model and optimizer state for momentum continuity.
+
+        Args:
+            checkpoint_path: Path to a world_model checkpoint (.pt file).
+            replay_buffer: Replay buffer (may contain new + old data).
+            device: Torch device.
+            lr: Learning rate (should be lower than initial training).
+            grad_clip: Max gradient norm.
+            seq_len: Sequence length for sampling.
+            batch_size: Batch size.
+
+        Returns:
+            Tuple of (WorldModel, WMTrainer) ready for training.
+        """
+        checkpoint_path = Path(checkpoint_path)
+        wm = WorldModel().to(device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        wm.load_state_dict(checkpoint["model_state_dict"])
+
+        trainer = cls(
+            world_model=wm,
+            replay_buffer=replay_buffer,
+            device=device,
+            lr=lr,
+            grad_clip=grad_clip,
+            seq_len=seq_len,
+            batch_size=batch_size,
+        )
+
+        # Restore optimizer state for momentum continuity
+        if "optimizer_state_dict" in checkpoint:
+            trainer.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            # Override LR to the fine-tune rate
+            for param_group in trainer.optimizer.param_groups:
+                param_group["lr"] = lr
+
+        print(f"  Loaded WM checkpoint from {checkpoint_path} (step {checkpoint.get('step', '?')})")
+        return wm, trainer
