@@ -31,13 +31,7 @@ def main():
         trainer.train(total_updates=args.total_updates)
     except KeyboardInterrupt:
         print("\nTraining interrupted. Saving checkpoint...")
-        from pacman.training.checkpoint import save_checkpoint
-        save_checkpoint(
-            Path(run_dir) / "checkpoints",
-            trainer.start_update, trainer.network, trainer.ppo.optimizer,
-            trainer.reward_normalizer.state_dict(),
-            trainer.curriculum_phase, config,
-        )
+        trainer._save(trainer.current_update, is_best=False)
         print("Checkpoint saved.")
 
 

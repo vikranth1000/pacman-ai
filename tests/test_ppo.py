@@ -11,7 +11,9 @@ from pacman.utils.config import load_config
 
 @pytest.fixture
 def config():
-    return load_config()
+    c = load_config()
+    c["ppo"]["minibatch_size"] = 16  # small for fast tests
+    return c
 
 
 @pytest.fixture

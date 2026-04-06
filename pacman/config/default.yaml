@@ -11,35 +11,44 @@ game:
     score: 100
 
 env:
-  num_envs: 64
+  num_envs: 128
   observation_channels: 8
   num_scalar_features: 5
+  frame_stack: 4
 
 network:
-  cnn_channels: [32, 64, 64]
+  cnn_channels: [64, 128, 128]
   cnn_kernels: [3, 3, 3]
   cnn_strides: [1, 2, 2]
   shared_hidden: 512
-  head_hidden: 128
+  head_hidden: 256
+
+rnd:
+  enabled: true
+  hidden_size: 256
+  output_size: 128
+  learning_rate: 1.0e-4
+  intrinsic_coef: 0.1
+  update_proportion: 0.25
 
 ppo:
   rollout_steps: 128
   num_epochs: 4
-  minibatch_size: 512
+  minibatch_size: 2048
   learning_rate: 2.5e-4
   lr_anneal: true
   gamma: 0.99
   gae_lambda: 0.95
   clip_epsilon: 0.2
   value_loss_coef: 0.5
-  entropy_coef_start: 0.01
-  entropy_coef_end: 0.001
-  entropy_anneal_fraction: 0.6
+  entropy_coef_start: 0.15
+  entropy_coef_end: 0.01
+  entropy_anneal_fraction: 0.7
   max_grad_norm: 0.5
   reward_clip: 10.0
 
 curriculum:
-  phase_thresholds: [0, 500, 2000]
+  phase_thresholds: [0, 800, 3000]
   difficulties: [0, 1, 2]
 
 rewards:
@@ -50,10 +59,11 @@ rewards:
   clear_level: 50.0
   death: -10.0
   game_over: -25.0
+  ghost_proximity: -0.3
   time_step: -0.01
 
 training:
-  total_updates: 5000
+  total_updates: 8000
   eval_every: 50
   eval_episodes: 20
   checkpoint_every: 100

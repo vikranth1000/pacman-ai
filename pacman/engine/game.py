@@ -371,4 +371,18 @@ def compute_reward(events: list[str], config: dict, state: GameState) -> float:
         elif event == "game_over":
             reward += reward_cfg["game_over"]
 
+    # Ghost proximity penalty — teaches avoidance even in scatter phase
+    proximity_penalty = reward_cfg.get("ghost_proximity", 0.0)
+    if proximity_penalty != 0.0:
+        pr, pc = int(state.pac_pos[0]), int(state.pac_pos[1])
+        for i in range(NUM_GHOSTS):
+            if state.ghost_in_house[i]:
+                continue
+            if state.ghost_mode[i] in (GhostMode.FRIGHTENED, GhostMode.EATEN):
+                continue
+            gr, gc = int(state.ghost_pos[i, 0]), int(state.ghost_pos[i, 1])
+            dist = abs(gr - pr) + abs(gc - pc)
+            if dist <= 2:
+                reward += proximity_penalty
+
     return reward

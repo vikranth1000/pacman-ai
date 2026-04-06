@@ -25,19 +25,36 @@ class PacmanEnv:
         self._state: GameState | None = None
         self._rng = np.random.default_rng()
 
+        # Frame stacking
+        self.frame_stack = config["env"].get("frame_stack", 1)
+        self._frame_buffer = None  # (frame_stack, C, H, W)
+
     def reset(self, seed: int | None = None) -> tuple[dict, dict]:
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         self._state = create_initial_state(self.config, self.difficulty)
-        obs = self._build_obs()
-        return obs, {}
+        raw_obs = self._build_obs()
+
+        if self.frame_stack > 1:
+            self._frame_buffer = np.tile(
+                raw_obs["grid"][np.newaxis],  # (1, C, H, W)
+                (self.frame_stack, 1, 1, 1),
+            )
+
+        return self._stack_obs(raw_obs), {}
 
     def step(self, action: int) -> tuple[dict, float, bool, bool, dict]:
         state, events, reward = step_game(
             self._state, action, self.config, self._return_paths, self._rng,
         )
         self._state = state
-        obs = self._build_obs()
+        raw_obs = self._build_obs()
+
+        if self.frame_stack > 1:
+            self._frame_buffer[:-1] = self._frame_buffer[1:]
+            self._frame_buffer[-1] = raw_obs["grid"]
+
+        obs = self._stack_obs(raw_obs)
         terminated = state.done
         truncated = False
         info = {
@@ -59,8 +76,15 @@ class PacmanEnv:
     def state(self) -> GameState:
         return self._state
 
+    def _stack_obs(self, raw_obs: dict) -> dict:
+        """Stack frames if frame_stack > 1, otherwise return raw obs."""
+        if self.frame_stack <= 1:
+            return raw_obs
+        stacked = self._frame_buffer.reshape(-1, MAZE_ROWS, MAZE_COLS)
+        return {"grid": stacked.copy(), "scalars": raw_obs["scalars"]}
+
     def _build_obs(self) -> dict:
-        """Build 8-channel grid + 4 scalars observation."""
+        """Build raw (unstacked) 8-channel grid + 5 scalars observation."""
         s = self._state
         grid = np.zeros((NUM_CHANNELS, MAZE_ROWS, MAZE_COLS), dtype=np.float32)
 
@@ -93,7 +117,7 @@ class PacmanEnv:
             s.pac_lives / self.config["game"]["lives"],
             s.pac_ghosts_eaten / 4.0,
             s.pellets_eaten / max(s.total_pellets, 1),
-            s.pac_dir / 3.0,  # previous direction normalized [0, 1]
+            s.pac_dir / 3.0,
         ], dtype=np.float32)
 
         return {"grid": grid, "scalars": scalars}

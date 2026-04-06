@@ -19,7 +19,7 @@ class VecEnv:
     """Vectorized Pac-Man environment stepping N games in parallel.
 
     Uses per-game step_game() internally with auto-reset.
-    A fully batched NumPy implementation can be done as a future optimization.
+    Supports frame stacking for temporal observations.
     """
 
     def __init__(self, num_envs: int, config: dict, difficulty: int = 0):
@@ -31,6 +31,10 @@ class VecEnv:
         self._states = []
         self._rngs = []
 
+        # Frame stacking
+        self.frame_stack = config["env"].get("frame_stack", 1)
+        self._frame_buffer = None  # (N, frame_stack, C, H, W)
+
     def reset(self, seed: int | None = None) -> dict:
         base_seed = seed if seed is not None else np.random.SeedSequence().entropy
         self._states = []
@@ -38,7 +42,17 @@ class VecEnv:
         for i in range(self.num_envs):
             self._states.append(create_initial_state(self.config, self.difficulty))
             self._rngs.append(np.random.default_rng(base_seed + i))
-        return self._build_batch_obs()
+
+        raw_obs = self._build_batch_obs()
+
+        if self.frame_stack > 1:
+            # Fill all frame slots with the initial observation
+            self._frame_buffer = np.tile(
+                raw_obs["grid"][:, np.newaxis],  # (N, 1, C, H, W)
+                (1, self.frame_stack, 1, 1, 1),
+            )
+
+        return self._stack_obs(raw_obs)
 
     def step(self, actions: np.ndarray) -> tuple[dict, np.ndarray, np.ndarray, dict]:
         """Step all environments. Auto-resets done envs.
@@ -72,15 +86,22 @@ class VecEnv:
             if state.done:
                 self._states[i] = create_initial_state(self.config, self.difficulty)
 
-        obs = self._build_batch_obs()
+        raw_obs = self._build_batch_obs()
+
+        # Update frame buffer
+        if self.frame_stack > 1:
+            self._frame_buffer[:, :-1] = self._frame_buffer[:, 1:]
+            self._frame_buffer[:, -1] = raw_obs["grid"]
+            # Reset frame buffer for done environments (new episode = no history)
+            for i in range(self.num_envs):
+                if dones[i]:
+                    self._frame_buffer[i, :] = raw_obs["grid"][i]
+
+        obs = self._stack_obs(raw_obs)
         return obs, rewards, dones, infos
 
     def get_legal_masks(self) -> np.ndarray:
-        """Return (N, 4) bool mask of legal actions per env.
-
-        Masks the reverse direction (arcade-style no-reverse) to prevent
-        oscillation. The reverse is only allowed if it's the sole legal move.
-        """
+        """Return (N, 4) bool mask of legal actions per env."""
         masks = np.zeros((self.num_envs, NUM_ACTIONS), dtype=bool)
         for i in range(self.num_envs):
             masks[i] = get_legal_actions(
@@ -94,8 +115,17 @@ class VecEnv:
         for state in self._states:
             state.difficulty = difficulty
 
+    def _stack_obs(self, raw_obs: dict) -> dict:
+        """Stack frames if frame_stack > 1, otherwise return raw obs."""
+        if self.frame_stack <= 1:
+            return raw_obs
+        stacked = self._frame_buffer.reshape(
+            self.num_envs, -1, MAZE_ROWS, MAZE_COLS,
+        )
+        return {"grid": stacked.copy(), "scalars": raw_obs["scalars"]}
+
     def _build_batch_obs(self) -> dict:
-        """Build batched observations: grid (N,8,31,28), scalars (N,4)."""
+        """Build raw (unstacked) batched observations: grid (N,8,31,28), scalars (N,5)."""
         grids = np.zeros((self.num_envs, NUM_CHANNELS, MAZE_ROWS, MAZE_COLS), dtype=np.float32)
         scalars = np.zeros((self.num_envs, NUM_SCALARS), dtype=np.float32)
         max_fright = self.config["game"]["frightened_duration"]
@@ -119,7 +149,7 @@ class VecEnv:
                 s.pac_lives / self.config["game"]["lives"],
                 s.pac_ghosts_eaten / 4.0,
                 s.pellets_eaten / max(s.total_pellets, 1),
-                s.pac_dir / 3.0,  # previous direction normalized [0, 1]
+                s.pac_dir / 3.0,
             ]
 
         return {"grid": grids, "scalars": scalars}

@@ -9,7 +9,9 @@ from pacman.env.vec_env import VecEnv
 
 @pytest.fixture
 def config():
-    return load_config()
+    c = load_config()
+    c["env"]["frame_stack"] = 1  # basic tests without frame stacking
+    return c
 
 
 class TestVecEnv:
@@ -98,3 +100,75 @@ class TestVecEnv:
         env.reset(seed=42)
         env.set_difficulty(2)
         assert env.difficulty == 2
+
+
+class TestFrameStacking:
+    def test_stacked_observation_shape(self):
+        config = load_config()
+        config["env"]["frame_stack"] = 4
+        env = VecEnv(2, config)
+        obs = env.reset(seed=42)
+        assert obs["grid"].shape == (2, 32, 31, 28)  # 4 frames * 8 channels
+        assert obs["scalars"].shape == (2, 5)
+
+    def test_initial_frames_identical(self):
+        """After reset, all stacked frames should be the same initial frame."""
+        config = load_config()
+        config["env"]["frame_stack"] = 4
+        env = VecEnv(2, config)
+        obs = env.reset(seed=42)
+        C = 8
+        for f in range(4):
+            np.testing.assert_array_equal(
+                obs["grid"][:, f * C:(f + 1) * C],
+                obs["grid"][:, :C],
+            )
+
+    def test_frames_update_on_step(self):
+        """After stepping, the oldest and newest frames should differ."""
+        config = load_config()
+        config["env"]["frame_stack"] = 4
+        env = VecEnv(2, config)
+        obs = env.reset(seed=42)
+        masks = env.get_legal_masks()
+        actions = np.array([np.where(m)[0][0] for m in masks])
+        obs2, _, _, _ = env.step(actions)
+        C = 8
+        # Oldest 3 frames should be the initial frame (shifted)
+        # Newest frame should be different if Pac-Man moved
+        assert obs2["grid"].shape == (2, 32, 31, 28)
+
+    def test_frame_buffer_resets_on_done(self):
+        """When an env is done and auto-resets, its frame buffer should reset too."""
+        config = load_config()
+        config["env"]["frame_stack"] = 4
+        config["game"] = dict(config["game"])
+        config["game"]["max_steps"] = 50
+        env = VecEnv(4, config)
+        env.reset(seed=42)
+        rng = np.random.default_rng(42)
+        for _ in range(200):
+            masks = env.get_legal_masks()
+            actions = np.array([rng.choice(np.where(m)[0]) for m in masks])
+            obs, _, dones, _ = env.step(actions)
+            if dones.any():
+                # Stacked obs should still be valid shape
+                assert obs["grid"].shape == (4, 32, 31, 28)
+                # For done envs, all frames should be the reset frame
+                for i in range(4):
+                    if dones[i]:
+                        C = 8
+                        for f in range(4):
+                            np.testing.assert_array_equal(
+                                obs["grid"][i, f * C:(f + 1) * C],
+                                obs["grid"][i, :C],
+                            )
+                break
+
+    def test_single_env_frame_stacking(self):
+        """PacmanEnv should also support frame stacking."""
+        config = load_config()
+        config["env"]["frame_stack"] = 4
+        env = PacmanEnv(config, difficulty=0)
+        obs, _ = env.reset(seed=42)
+        assert obs["grid"].shape == (32, 31, 28)

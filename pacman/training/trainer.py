@@ -1,5 +1,5 @@
 # pacman/training/trainer.py
-"""PPO training orchestrator."""
+"""PPO training orchestrator with frame stacking and RND curiosity."""
 import time
 from pathlib import Path
 
@@ -31,6 +31,8 @@ class _CSVWriter:
         if self._file is not None:
             self._file.close()
 
+
+from ..engine.constants import MAZE_ROWS, MAZE_COLS
 from ..env.vec_env import VecEnv
 from ..agents.networks import ActorCritic
 from ..agents.ppo import PPO
@@ -100,13 +102,20 @@ class Trainer:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.device = get_device(config)
 
-        # Environment
+        # Frame stacking config
         env_cfg = config["env"]
+        self.frame_stack = env_cfg.get("frame_stack", 1)
+        self.obs_channels = env_cfg["observation_channels"]
+        grid_channels = self.obs_channels * self.frame_stack
+
+        # Environment
         self.vec_env = VecEnv(env_cfg["num_envs"], config, difficulty=0)
 
-        # Network
+        # Network — wider architecture with frame-stacked input
         net_cfg = config["network"]
         self.network = ActorCritic(
+            grid_channels=grid_channels,
+            num_scalars=env_cfg["num_scalar_features"],
             cnn_channels=net_cfg["cnn_channels"],
             cnn_kernels=net_cfg["cnn_kernels"],
             cnn_strides=net_cfg["cnn_strides"],
@@ -117,17 +126,36 @@ class Trainer:
         # PPO
         self.ppo = PPO(self.network, config, self.device)
 
-        # Rollout buffer
+        # Rollout buffer — uses stacked grid channels
         self.rollout = RolloutBuffer(
             num_envs=env_cfg["num_envs"],
             rollout_steps=config["ppo"]["rollout_steps"],
-            grid_shape=(env_cfg["observation_channels"], 31, 28),
+            grid_shape=(grid_channels, MAZE_ROWS, MAZE_COLS),
             num_scalars=env_cfg["num_scalar_features"],
             num_actions=4,
         )
 
         # Reward normalization
         self.reward_normalizer = RunningMeanStd()
+
+        # RND intrinsic curiosity
+        rnd_cfg = config.get("rnd", {})
+        self.use_rnd = rnd_cfg.get("enabled", False)
+        self.rnd = None
+        self.rnd_normalizer = None
+        self.rnd_coef = 0.0
+        if self.use_rnd:
+            from ..agents.rnd import RNDModule
+            self.rnd = RNDModule(
+                input_channels=self.obs_channels,
+                grid_h=MAZE_ROWS,
+                grid_w=MAZE_COLS,
+                hidden_size=rnd_cfg.get("hidden_size", 256),
+                output_size=rnd_cfg.get("output_size", 128),
+                learning_rate=rnd_cfg.get("learning_rate", 1e-4),
+            ).to(self.device)
+            self.rnd_coef = rnd_cfg.get("intrinsic_coef", 0.1)
+            self.rnd_normalizer = RunningMeanStd()
 
         # Evaluator
         self.evaluator = Evaluator(config)
@@ -144,6 +172,7 @@ class Trainer:
         self.curriculum_phase = 0
         self.best_clear_rate = 0.0
         self.start_update = 0
+        self._entropy_boost_until = -1  # update number until which to boost entropy
 
         if resume:
             ckpt_dir = self.run_dir / "checkpoints"
@@ -154,6 +183,13 @@ class Trainer:
                 norm_state = meta.get("reward_normalizer", {})
                 if norm_state:
                     self.reward_normalizer.load_state_dict(norm_state)
+                # Restore RND state
+                rnd_state = meta.get("rnd_state")
+                if rnd_state and self.rnd is not None:
+                    self.rnd.load_state_dict(rnd_state["model_state_dict"])
+                    self.rnd.optimizer.load_state_dict(rnd_state["optimizer_state_dict"])
+                    if "rnd_normalizer" in rnd_state:
+                        self.rnd_normalizer.load_state_dict(rnd_state["rnd_normalizer"])
 
     def train(self, total_updates: int | None = None) -> None:
         total = total_updates or self.config["training"]["total_updates"]
@@ -164,8 +200,10 @@ class Trainer:
         T = ppo_cfg["rollout_steps"]
 
         obs = self.vec_env.reset(seed=42)
+        self.current_update = self.start_update
 
         for update in range(self.start_update, total):
+            self.current_update = update
             t_start = time.time()
 
             # --- Anneal schedules ---
@@ -185,7 +223,21 @@ class Trainer:
                 )
                 next_obs, rewards, dones, infos = self.vec_env.step(actions)
 
-                # Normalize rewards
+                # Add intrinsic curiosity rewards from RND
+                if self.use_rnd:
+                    latest_frame = next_obs["grid"][:, -self.obs_channels:]
+                    grid_t = torch.as_tensor(
+                        latest_frame.copy(), device=self.device,
+                    )
+                    raw_intrinsic = self.rnd.compute_intrinsic_reward(grid_t)
+                    raw_intrinsic = raw_intrinsic.cpu().numpy()
+                    # Normalize by running std (not mean-centered)
+                    self.rnd_normalizer.update(raw_intrinsic)
+                    norm_intrinsic = raw_intrinsic / (np.sqrt(self.rnd_normalizer.var) + 1e-8)
+                    norm_intrinsic = np.clip(norm_intrinsic, -5.0, 5.0)
+                    rewards = rewards + self.rnd_coef * norm_intrinsic
+
+                # Normalize combined rewards
                 self.reward_normalizer.update(rewards)
                 norm_rewards = self.reward_normalizer.normalize(rewards)
 
@@ -206,6 +258,11 @@ class Trainer:
             # --- PPO Update ---
             metrics = self.ppo.update(self.rollout)
 
+            # --- RND Update ---
+            if self.use_rnd:
+                rnd_loss = self._update_rnd()
+                metrics["rnd_loss"] = rnd_loss
+
             # --- Logging ---
             fps = N * T / (time.time() - t_start)
             if update % train_cfg["log_every"] == 0:
@@ -218,8 +275,12 @@ class Trainer:
                 self.writer.add_scalar("schedule/curriculum_phase",
                                        self.curriculum_phase, update)
                 self.writer.add_scalar("throughput/fps", fps, update)
+                if self.use_rnd:
+                    self.writer.add_scalar("rnd/loss", metrics.get("rnd_loss", 0), update)
+                    self.writer.add_scalar("rnd/reward_var", self.rnd_normalizer.var, update)
 
             # --- Evaluation ---
+            is_best = False
             if update % train_cfg["eval_every"] == 0 and update > 0:
                 eval_result = self.evaluator.evaluate(
                     self.network, train_cfg["eval_episodes"], self.device,
@@ -238,24 +299,47 @@ class Trainer:
 
             # --- Checkpoint ---
             if update % train_cfg["checkpoint_every"] == 0 and update > 0:
-                is_best = False  # already handled above
-                save_checkpoint(
-                    self.run_dir / "checkpoints", update,
-                    self.network, self.ppo.optimizer,
-                    self.reward_normalizer.state_dict(),
-                    self.curriculum_phase, self.config,
-                    is_best=False,
-                )
+                self._save(update, is_best=is_best)
 
         # Final checkpoint
+        self._save(total - 1, is_best=is_best)
+        self.writer.close()
+
+    def _save(self, update: int, is_best: bool = False) -> None:
+        """Save checkpoint including RND state if active."""
+        rnd_state = None
+        if self.use_rnd:
+            rnd_state = {
+                "model_state_dict": self.rnd.state_dict(),
+                "optimizer_state_dict": self.rnd.optimizer.state_dict(),
+                "rnd_normalizer": self.rnd_normalizer.state_dict(),
+            }
         save_checkpoint(
-            self.run_dir / "checkpoints", total - 1,
+            self.run_dir / "checkpoints", update,
             self.network, self.ppo.optimizer,
             self.reward_normalizer.state_dict(),
             self.curriculum_phase, self.config,
-            is_best=False,
+            is_best=is_best, rnd_state=rnd_state,
         )
-        self.writer.close()
+
+    def _update_rnd(self) -> float:
+        """Update RND predictor on observations from the rollout."""
+        rnd_cfg = self.config.get("rnd", {})
+        proportion = rnd_cfg.get("update_proportion", 0.25)
+
+        # Extract latest frames from stored stacked observations
+        all_grids = self.rollout.obs_grids  # (T, N, stacked_C, H, W)
+        latest = all_grids[:, :, -self.obs_channels:]  # (T, N, 8, H, W)
+        T, N = latest.shape[:2]
+        total = T * N
+        flat = latest.reshape(total, self.obs_channels, MAZE_ROWS, MAZE_COLS)
+
+        # Sample subset for efficiency
+        num_samples = max(int(total * proportion), 64)
+        indices = np.random.choice(total, size=min(num_samples, total), replace=False)
+        batch = torch.as_tensor(flat[indices].copy(), device=self.device)
+
+        return self.rnd.update(batch)
 
     def _get_entropy_coef(self, update: int, total: int) -> float:
         cfg = self.config["ppo"]
@@ -263,9 +347,16 @@ class Trainer:
         end = cfg["entropy_coef_end"]
         anneal_frac = cfg["entropy_anneal_fraction"]
         if update < total * anneal_frac:
-            return start
-        progress = (update - total * anneal_frac) / (total * (1 - anneal_frac))
-        return start + (end - start) * min(progress, 1.0)
+            coef = start
+        else:
+            progress = (update - total * anneal_frac) / (total * (1 - anneal_frac))
+            coef = start + (end - start) * min(progress, 1.0)
+
+        # Entropy boost after curriculum transitions — force re-exploration
+        if update < self._entropy_boost_until:
+            coef = max(coef, start * 2)
+
+        return coef
 
     def _advance_curriculum(self, update: int, curriculum_cfg: dict) -> None:
         thresholds = curriculum_cfg["phase_thresholds"]
@@ -278,5 +369,8 @@ class Trainer:
         if target_phase != self.curriculum_phase:
             self.curriculum_phase = target_phase
             self.vec_env.set_difficulty(difficulties[target_phase])
+            # Boost entropy for 300 updates after phase transition
+            self._entropy_boost_until = update + 300
             print(f"[Update {update}] Curriculum -> phase {target_phase} "
-                  f"(difficulty={difficulties[target_phase]})")
+                  f"(difficulty={difficulties[target_phase]}) "
+                  f"[entropy boost until {update + 300}]")

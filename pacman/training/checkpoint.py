@@ -1,5 +1,5 @@
 # pacman/training/checkpoint.py
-"""Checkpoint save/load for PPO training."""
+"""Checkpoint save/load for PPO training with optional RND state."""
 from pathlib import Path
 import torch
 
@@ -13,6 +13,7 @@ def save_checkpoint(
     curriculum_phase: int,
     config: dict,
     is_best: bool = False,
+    rnd_state: dict | None = None,
 ) -> None:
     path.mkdir(parents=True, exist_ok=True)
     data = {
@@ -23,6 +24,8 @@ def save_checkpoint(
         "curriculum_phase": curriculum_phase,
         "config": config,
     }
+    if rnd_state is not None:
+        data["rnd_state"] = rnd_state
     torch.save(data, path / f"update_{update}.pt")
     torch.save(data, path / "latest.pt")
     if is_best:
@@ -44,4 +47,5 @@ def load_checkpoint(
         "reward_normalizer": data.get("reward_normalizer", {}),
         "curriculum_phase": data.get("curriculum_phase", 0),
         "config": data.get("config", {}),
+        "rnd_state": data.get("rnd_state", None),
     }

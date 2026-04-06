@@ -14,6 +14,23 @@ from pacman.training.trainer import get_device
 from pacman.viz.renderer import GameRenderer
 
 
+def _build_network_from_config(config):
+    """Build ActorCritic with architecture matching the config."""
+    env_cfg = config["env"]
+    net_cfg = config["network"]
+    frame_stack = env_cfg.get("frame_stack", 1)
+    grid_channels = env_cfg["observation_channels"] * frame_stack
+    return ActorCritic(
+        grid_channels=grid_channels,
+        num_scalars=env_cfg.get("num_scalar_features", 5),
+        cnn_channels=net_cfg.get("cnn_channels", [32, 64, 64]),
+        cnn_kernels=net_cfg.get("cnn_kernels", [3, 3, 3]),
+        cnn_strides=net_cfg.get("cnn_strides", [1, 2, 2]),
+        shared_hidden=net_cfg.get("shared_hidden", 512),
+        head_hidden=net_cfg.get("head_hidden", 128),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", type=str, default=None)
@@ -27,9 +44,17 @@ def main():
 
     network = None
     if args.run_dir:
-        network = ActorCritic()
-        load_checkpoint(Path(args.run_dir) / "checkpoints", network, filename=args.checkpoint)
+        ckpt_path = Path(args.run_dir) / "checkpoints"
+        # Load checkpoint to get saved config for architecture matching
+        ckpt_data = torch.load(
+            ckpt_path / args.checkpoint, map_location="cpu", weights_only=False,
+        )
+        saved_config = ckpt_data.get("config", config)
+        network = _build_network_from_config(saved_config)
+        network.load_state_dict(ckpt_data["model_state_dict"])
         network.to(device).eval()
+        # Use saved config for env too (frame stacking etc.)
+        config = saved_config
 
     env = PacmanEnv(config, difficulty=2)
     renderer = GameRenderer(config)
