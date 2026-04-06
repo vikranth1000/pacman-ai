@@ -13,7 +13,7 @@ from pacman.world_model.world_model import WorldModel
 from pacman.world_model.replay_buffer import EpisodeReplayBuffer
 from pacman.training.dream_trainer import DreamTrainer, DreamPolicy
 from pacman.training.wm_trainer import WMTrainer
-from scripts.collect_dream_data import collect_dream_episodes
+from pacman.training.dream_collector import collect_dream_episodes
 
 
 def run_online_loop(
