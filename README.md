@@ -1,6 +1,6 @@
 # Pac-Man AI
 
-A deep reinforcement learning agent that learns to play Pac-Man from scratch using **Proximal Policy Optimization (PPO)** with convolutional neural network observations on a fully vectorized game engine.
+A deep reinforcement learning agent that learns to play Pac-Man from scratch using **Proximal Policy Optimization (PPO)** with convolutional neural network observations on a fully vectorized game engine. Includes a **world model (RSSM)** that learns to simulate the game in latent space, enabling imagination-based training.
 
 <div align="center">
 
@@ -18,7 +18,7 @@ A deep reinforcement learning agent that learns to play Pac-Man from scratch usi
  ╚══════════════════════════════╝
 ```
 
-**92 tests passing** · **2,800+ fps** · **64 parallel environments** · **PPO + CNN**
+**79 tests passing** · **2,800+ fps** · **128 parallel environments** · **PPO + CNN + World Model**
 
 </div>
 
@@ -232,21 +232,120 @@ pacman-ai/
 │   │   ├── pacman_env.py    # Single-game Gymnasium interface
 │   │   └── vec_env.py       # N parallel games with auto-reset
 │   ├── training/
-│   │   ├── trainer.py       # Training orchestrator + curriculum
+│   │   ├── trainer.py       # PPO training orchestrator + curriculum
 │   │   ├── evaluator.py     # Greedy policy evaluation
-│   │   └── checkpoint.py    # Save/load model state
+│   │   ├── checkpoint.py    # Save/load model state
+│   │   ├── wm_trainer.py    # World model training loop
+│   │   └── dream_trainer.py # Imagination PPO training loop
+│   ├── world_model/
+│   │   ├── rssm.py          # RSSM: GRU dynamics + categorical stochastic state
+│   │   ├── encoder.py       # CNN encoder: observation → latent
+│   │   ├── decoder.py       # Transposed CNN decoder: latent → observation
+│   │   ├── heads.py         # Reward and continue prediction MLPs
+│   │   ├── world_model.py   # Integrated model with train_step() and imagine()
+│   │   └── replay_buffer.py # Sequential episode storage
 │   └── viz/
 │       ├── renderer.py      # Pygame game renderer
 │       ├── sprites.py       # Pac-Man & ghost sprites
-│       └── dashboard.py     # Live training metrics (Dash + Plotly)
+│       ├── dashboard.py     # Live training metrics (Dash + Plotly)
+│       └── dream_viewer.py  # Side-by-side real vs dream visualization
 ├── scripts/
-│   ├── train.py             # Training entry point
+│   ├── train.py             # PPO training entry point
 │   ├── evaluate.py          # Evaluate a checkpoint
 │   ├── watch.py             # Watch agent play in real-time
-│   └── dashboard.py         # Launch metrics dashboard
-├── tests/                   # 92 tests covering all modules
+│   ├── collect_data.py      # Collect gameplay data for world model
+│   ├── train_world_model.py # Train RSSM from collected data
+│   ├── train_dreamer.py     # Train agent in imagination
+│   └── watch_dreams.py      # Launch dream viewer
+├── tests/                   # 79 tests covering all modules
+├── Dockerfile
 └── pyproject.toml
 ```
+
+---
+
+## Dreaming Pac-Man: World Model
+
+The project includes a **latent world model** that learns to simulate Pac-Man entirely from gameplay data, then trains an RL agent purely inside the model's imagination — no real environment interaction needed.
+
+### Three-Phase Pipeline
+
+```mermaid
+graph LR
+    A["Phase A: Data Collection<br/>Trained PPO agent plays<br/>1000 episodes"] --> B["Phase B: World Model Training<br/>RSSM learns to simulate<br/>the game in latent space"]
+    B --> C["Phase C: Imagination Training<br/>PPO agent trains entirely<br/>inside the model's dreams"]
+```
+
+### RSSM Architecture
+
+The **Recurrent State-Space Model** learns a compressed simulation of the game:
+
+```
+Observation (8×31×28) ──→ CNN Encoder ──→ Posterior z
+                                              │
+                    ┌─────────────────────────┘
+                    ▼
+              GRU Dynamics (h) ──→ Prior z (imagination)
+                    │
+                    ├──→ CNN Decoder ──→ Reconstructed observation
+                    ├──→ Reward Head ──→ Predicted reward
+                    └──→ Continue Head ──→ Termination probability
+```
+
+| Component | Details |
+|-----------|---------|
+| **Deterministic state (h)** | GRU with 512 hidden units — captures long-term memory |
+| **Stochastic state (z)** | 32 classes × 64 categoricals = 2048 dims — captures current situation |
+| **Encoder** | 4-layer CNN [64, 128, 256, 256] with scalar embedding |
+| **Decoder** | Transposed CNN mirror + bilinear interpolation |
+| **Total latent dim** | 2560 (h=512 + z=2048) |
+| **Parameters** | ~28M |
+
+### Dream Agent
+
+Once the world model is trained, a lightweight MLP policy (2560→512→256→4) trains entirely in latent space using PPO on imagined rollouts. The dream agent:
+
+- Operates on the compact latent representation (2560 dims vs raw 8×31×28 observations)
+- Runs 512 parallel imaginations of 15 steps each
+- Uses GAE with continuation probabilities from the world model
+- Is periodically evaluated in the real game to measure transfer quality
+
+### Dream Viewer
+
+Side-by-side visualization comparing real gameplay with the world model's reconstruction:
+
+```
+┌──────────────────────┬──────────────────────┐
+│    REAL GAME          │    MODEL'S DREAM      │
+│    [actual game]      │    [decoded from       │
+│                       │     latent state]      │
+│  Score: 3200          │  Predicted: 3180       │
+│  Step: 847            │  Divergence: 0.023     │
+└──────────────────────┴──────────────────────┘
+```
+
+### Running the World Model Pipeline
+
+```bash
+# Step 1: Collect data from trained agent (~15 min)
+python scripts/collect_data.py --checkpoint runs/.../checkpoints/latest.pt --episodes 1000
+
+# Step 2: Train world model (~7 hours on MPS)
+python scripts/train_world_model.py --data runs/.../replay_buffer.pt
+
+# Step 3: Train dream agent (~2 hours)
+python scripts/train_dreamer.py --world-model runs/.../world_model/world_model_latest.pt
+
+# Step 4: Watch side-by-side comparison
+python scripts/watch_dreams.py --world-model runs/.../world_model/world_model_latest.pt
+```
+
+### Research Context
+
+This implementation draws from:
+- **Dreamer V3** (Hafner et al., 2023) — RSSM architecture with categorical stochastic state
+- **DIAMOND** (NeurIPS 2024) — world model paradigm for game simulation
+- **Genie 3** (DeepMind) — imagination-based agent training
 
 ---
 
@@ -270,13 +369,14 @@ Without knowing its previous direction, the agent oscillates at junctions (go le
 
 | Component | Technology |
 |-----------|-----------|
-| Game Engine | NumPy (vectorized, 64 parallel games) |
-| Neural Network | PyTorch (CNN Actor-Critic) |
-| RL Algorithm | PPO with GAE |
+| Game Engine | NumPy (vectorized, 128 parallel games) |
+| Neural Network | PyTorch (CNN Actor-Critic + RSSM World Model) |
+| RL Algorithm | PPO with GAE (real + imagined environments) |
+| World Model | RSSM with categorical stochastic state (~28M params) |
 | Acceleration | Apple MPS / CUDA / CPU |
-| Visualization | Pygame (game) + Dash/Plotly (metrics) |
+| Visualization | Pygame (game + dream viewer) + Dash/Plotly (metrics) |
 | Experiment Tracking | TensorBoard |
-| Testing | pytest (92 tests) |
+| Testing | pytest (79 tests) |
 
 ---
 
