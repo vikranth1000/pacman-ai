@@ -80,7 +80,12 @@ class DreamTrainer:
         gamma: Discount factor.
         gae_lambda: GAE lambda for advantage estimation.
         clip_epsilon: PPO clipped surrogate epsilon.
-        entropy_coef: Entropy bonus coefficient.
+        entropy_coef_start: Starting entropy bonus coefficient (high for exploration).
+        entropy_coef_end: Final entropy bonus coefficient after annealing.
+        entropy_anneal_fraction: Fraction of training over which to anneal entropy.
+        min_entropy: Minimum entropy threshold; below this the coef is tripled.
+        latent_noise: Std of Gaussian noise added to latent states during imagination
+            to prevent overfitting to world model imperfections.
         value_coef: Value loss coefficient.
         ppo_epochs: Number of PPO epochs per update.
     """
@@ -90,15 +95,19 @@ class DreamTrainer:
         world_model: WorldModel,
         config: dict,
         device: torch.device,
-        imagination_horizon: int = 15,
+        imagination_horizon: int = 10,
         num_imaginations: int = 512,
         lr: float = 1e-4,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_epsilon: float = 0.2,
-        entropy_coef: float = 0.01,
+        entropy_coef_start: float = 0.5,
+        entropy_coef_end: float = 0.05,
+        entropy_anneal_fraction: float = 0.7,
+        min_entropy: float = 0.3,
+        latent_noise: float = 0.1,
         value_coef: float = 0.5,
-        ppo_epochs: int = 4,
+        ppo_epochs: int = 2,
     ) -> None:
         self.device = device
         self.config = config
@@ -107,7 +116,11 @@ class DreamTrainer:
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.clip_epsilon = clip_epsilon
-        self.entropy_coef = entropy_coef
+        self.entropy_coef_start = entropy_coef_start
+        self.entropy_coef_end = entropy_coef_end
+        self.entropy_anneal_fraction = entropy_anneal_fraction
+        self.min_entropy = min_entropy
+        self.latent_noise = latent_noise
         self.value_coef = value_coef
         self.ppo_epochs = ppo_epochs
 
@@ -123,7 +136,7 @@ class DreamTrainer:
 
         # Cache starting states to avoid regenerating every update
         self._cached_starts: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._starts_refresh_every = 50  # regenerate every N updates
+        self._starts_refresh_every = 20  # regenerate every N updates
 
     # ------------------------------------------------------------------
     # Starting states
@@ -209,6 +222,10 @@ class DreamTrainer:
         for _ in range(H):
             # Concatenate latent (detach h and z so WM grads don't flow)
             latent = torch.cat([h.detach(), z.detach()], dim=-1)  # (B, latent_dim)
+
+            # Add noise to latent to prevent overfitting to world model quirks
+            if self.latent_noise > 0 and self.policy.training:
+                latent = latent + self.latent_noise * torch.randn_like(latent)
 
             # Policy forward -- WITH grad (this is what we train)
             logits, value = self.policy(latent)
@@ -299,11 +316,20 @@ class DreamTrainer:
     # PPO update
     # ------------------------------------------------------------------
 
+    def _get_entropy_coef(self, update: int, total_updates: int) -> float:
+        """Anneal entropy coefficient from start to end over the anneal fraction."""
+        anneal_end = int(total_updates * self.entropy_anneal_fraction)
+        if update >= anneal_end:
+            return self.entropy_coef_end
+        frac = update / max(anneal_end, 1)
+        return self.entropy_coef_start + frac * (self.entropy_coef_end - self.entropy_coef_start)
+
     def _ppo_update(
         self,
         rollout: dict[str, torch.Tensor],
         advantages: torch.Tensor,
         returns: torch.Tensor,
+        entropy_coef: float = 0.15,
     ) -> dict[str, float]:
         """Run PPO clipped surrogate update on imagination data.
 
@@ -311,6 +337,7 @@ class DreamTrainer:
             rollout: Dictionary from _imagine_rollout.
             advantages: (B, H) advantage estimates.
             returns: (B, H) return targets.
+            entropy_coef: Current entropy bonus coefficient.
 
         Returns:
             Dictionary of average loss values.
@@ -355,8 +382,13 @@ class DreamTrainer:
             # Value loss (MSE)
             v_loss = F.mse_loss(values, flat_returns)
 
+            # Entropy floor: if entropy drops below min_entropy, boost penalty
+            effective_entropy_coef = entropy_coef
+            if entropy.item() < self.min_entropy:
+                effective_entropy_coef = entropy_coef * 3.0
+
             # Total loss
-            loss = pg_loss + self.value_coef * v_loss - self.entropy_coef * entropy
+            loss = pg_loss + self.value_coef * v_loss - effective_entropy_coef * entropy
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -479,9 +511,10 @@ class DreamTrainer:
         self,
         total_updates: int = 5000,
         log_every: int = 10,
-        eval_every: int = 100,
+        eval_every: int = 50,
         eval_episodes: int = 20,
         save_dir: str | Path | None = None,
+        patience: int = 500,
     ) -> None:
         """Main dream training loop.
 
@@ -490,6 +523,7 @@ class DreamTrainer:
         3. Compute GAE advantages
         4. PPO update on imagined data
         5. Periodically evaluate in real environment
+        6. Early stop if real eval doesn't improve for `patience` updates
 
         Args:
             total_updates: Total number of imagination + PPO update cycles.
@@ -497,6 +531,7 @@ class DreamTrainer:
             eval_every: Evaluate in real environment every N updates.
             eval_episodes: Number of episodes per real-env evaluation.
             save_dir: Directory to save checkpoints. If None, saving is skipped.
+            patience: Stop if real eval score doesn't improve for this many updates.
         """
         if save_dir is not None:
             save_dir = Path(save_dir)
@@ -504,6 +539,7 @@ class DreamTrainer:
 
         self.policy.train()
         best_score = -float("inf")
+        best_update = 0
         start_time = time.time()
 
         print(f"Starting dream training: {total_updates} updates")
@@ -525,8 +561,9 @@ class DreamTrainer:
             # 3. Compute GAE
             advantages, returns = self._compute_gae(rollout)
 
-            # 4. PPO update
-            losses = self._ppo_update(rollout, advantages, returns)
+            # 4. PPO update (with annealed entropy coef)
+            entropy_coef = self._get_entropy_coef(update, total_updates)
+            losses = self._ppo_update(rollout, advantages, returns, entropy_coef=entropy_coef)
 
             # 5. Log
             if update % log_every == 0:
@@ -550,13 +587,23 @@ class DreamTrainer:
                     f"level_clear_rate={eval_result['level_clear_rate']:.2%}"
                 )
 
-                # Save best model
+                # Save best model + early stopping check
                 if save_dir is not None:
                     is_best = eval_result["mean_score"] > best_score
                     if is_best:
                         best_score = eval_result["mean_score"]
+                        best_update = update
                         print(f"  New best score: {best_score:.1f}")
                     self._save(save_dir, update, is_best=is_best)
+
+                # Early stopping: if no improvement for `patience` updates
+                if update - best_update >= patience and best_update > 0:
+                    print(
+                        f"\n  Early stopping: no improvement for {patience} updates "
+                        f"(best={best_score:.1f} at update {best_update})",
+                        flush=True,
+                    )
+                    break
 
         # Final evaluation and save
         print("\nFinal evaluation...")
