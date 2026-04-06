@@ -515,7 +515,7 @@ class DreamTrainer:
         eval_episodes: int = 20,
         save_dir: str | Path | None = None,
         patience: int = 500,
-    ) -> None:
+    ) -> dict:
         """Main dream training loop.
 
         1. Sample diverse starting states from real environment
@@ -614,7 +614,16 @@ class DreamTrainer:
         )
         if save_dir is not None:
             is_best = eval_result["mean_score"] > best_score
+            if is_best:
+                best_score = eval_result["mean_score"]
+                best_update = total_updates
             self._save(save_dir, total_updates, is_best=is_best)
             print(f"Final checkpoint saved.")
 
+        best_path = save_dir / "dream_agent_best.pt" if save_dir else Path(".")
         print("Dream training complete.")
+        return {
+            "best_score": float(best_score),
+            "best_update": int(best_update),
+            "best_path": best_path,
+        }
