@@ -155,8 +155,9 @@ class WorldModel(nn.Module):
         prior_logits_seq = torch.stack(prior_logits_list, dim=1)  # (B, T, C, K)
         post_logits_seq = torch.stack(post_logits_list, dim=1)    # (B, T, C, K)
 
-        post_probs = F.softmax(post_logits_seq, dim=-1)
-        prior_probs = F.softmax(prior_logits_seq, dim=-1)
+        eps = 1e-8
+        post_probs = F.softmax(post_logits_seq, dim=-1).clamp(min=eps)
+        prior_probs = F.softmax(prior_logits_seq, dim=-1).clamp(min=eps)
 
         # KL(posterior || prior) per categorical, summed over classes, averaged over batch/time
         kl_per_cat = (post_probs * (post_probs.log() - prior_probs.log())).sum(dim=-1)  # (B, T, C)

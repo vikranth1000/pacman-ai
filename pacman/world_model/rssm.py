@@ -144,6 +144,9 @@ class RSSM(nn.Module):
     def _sample_categorical(self, logits: torch.Tensor) -> torch.Tensor:
         """Sample from categorical distributions with straight-through gradients.
 
+        Uses a manual Gumbel-softmax implementation that clamps uniform samples
+        to avoid NaN on MPS (where torch.rand can produce exact 0.0/1.0).
+
         Args:
             logits: Unnormalized log-probabilities of shape (B, stoch_classes, stoch_categoricals).
 
@@ -151,8 +154,14 @@ class RSSM(nn.Module):
             One-hot encoded and flattened samples of shape (B, stoch_dim).
         """
         if self.training:
-            # Gumbel-softmax with hard=True for straight-through gradients
-            onehot = F.gumbel_softmax(logits, tau=1.0, hard=True, dim=-1)
+            # Manual Gumbel-softmax: clamp uniform to avoid log(0) NaN on MPS
+            u = torch.rand_like(logits).clamp(1e-8, 1.0 - 1e-8)
+            gumbel_noise = -torch.log(-torch.log(u))
+            y_soft = F.softmax((logits + gumbel_noise) / 1.0, dim=-1)
+            # Straight-through: hard one-hot in forward, soft gradients in backward
+            indices = y_soft.argmax(dim=-1)
+            onehot = F.one_hot(indices, self.stoch_categoricals).float()
+            onehot = onehot + y_soft - y_soft.detach()  # straight-through
         else:
             # Argmax at eval time
             indices = logits.argmax(dim=-1)

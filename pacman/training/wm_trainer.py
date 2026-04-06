@@ -1,6 +1,7 @@
 """World Model training loop."""
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 
@@ -97,7 +98,8 @@ class WMTrainer:
                     f"total={avg['total']:.4f} recon={avg['recon']:.4f} "
                     f"reward={avg['reward']:.4f} continue={avg['continue']:.4f} "
                     f"kl={avg['kl']:.4f} | "
-                    f"{steps_per_sec:.1f} steps/s"
+                    f"{steps_per_sec:.1f} steps/s",
+                    flush=True,
                 )
                 log_losses = {}
                 log_count = 0

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ObservationDecoder(nn.Module):
@@ -13,7 +14,7 @@ class ObservationDecoder(nn.Module):
     - FC: Linear(latent_dim, start_channels * start_h * start_w) + SiLU, reshape to (B, C, H, W)
     - Transposed CNN layers: ConvTranspose2d + SiLU (all but last)
     - Final ConvTranspose2d outputs grid_channels with no activation
-    - AdaptiveAvgPool2d((31, 28)) to guarantee exact output shape
+    - F.interpolate to guarantee exact (31, 28) output shape (MPS-compatible)
     - Separate scalar head: Linear(latent_dim, 256) + SiLU + Linear(256, num_scalars)
 
     Args:
@@ -61,8 +62,6 @@ class ObservationDecoder(nn.Module):
                 deconv_layers.append(nn.SiLU())
             in_ch = out_ch
 
-        # Final adaptive pool to guarantee (31, 28) output
-        deconv_layers.append(nn.AdaptiveAvgPool2d((31, 28)))
         self.deconv = nn.Sequential(*deconv_layers)
 
         # Scalar reconstruction head (independent of deconv path)
@@ -88,7 +87,10 @@ class ObservationDecoder(nn.Module):
         # Grid branch
         x = self.fc(latent)  # (B, start_channels * H * W)
         x = x.view(B, self._start_channels, self._START_H, self._START_W)
-        grid = self.deconv(x)  # (B, grid_channels, 31, 28)
+        grid = self.deconv(x)
+        # Resize to exact (31, 28) — bilinear interpolate is MPS-compatible
+        if grid.shape[-2:] != (31, 28):
+            grid = F.interpolate(grid, size=(31, 28), mode="bilinear", align_corners=False)
 
         # Scalar branch
         scalars = self.scalar_head(latent)  # (B, num_scalars)
