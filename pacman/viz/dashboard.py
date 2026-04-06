@@ -101,6 +101,31 @@ def create_dashboard(log_dir: str | Path) -> Dash:
                                 "verticalAlign": "top"}),
             ]),
 
+            # --- World Model Section ---
+            html.H2("World Model Training",
+                     style={"textAlign": "center", "color": "#BB86FC",
+                            "fontFamily": "monospace", "marginTop": "30px"}),
+
+            # Row 4: WM Reconstruction + Reward prediction
+            html.Div([
+                html.Div([dcc.Graph(id="wm-recon-chart")],
+                         style={"width": "48%", "display": "inline-block",
+                                "verticalAlign": "top"}),
+                html.Div([dcc.Graph(id="wm-reward-chart")],
+                         style={"width": "48%", "display": "inline-block",
+                                "verticalAlign": "top"}),
+            ]),
+
+            # Row 5: KL divergence + Dream agent score
+            html.Div([
+                html.Div([dcc.Graph(id="wm-kl-chart")],
+                         style={"width": "48%", "display": "inline-block",
+                                "verticalAlign": "top"}),
+                html.Div([dcc.Graph(id="dream-score-chart")],
+                         style={"width": "48%", "display": "inline-block",
+                                "verticalAlign": "top"}),
+            ]),
+
         ], style={"backgroundColor": "#0a0a1a", "minHeight": "100vh",
                   "padding": "10px"}),
     ], style={"backgroundColor": "#0a0a1a"})
@@ -112,7 +137,11 @@ def create_dashboard(log_dir: str | Path) -> Dash:
          Output("loss-chart", "figure"),
          Output("episode-length-chart", "figure"),
          Output("throughput-chart", "figure"),
-         Output("ghost-kills-chart", "figure")],
+         Output("ghost-kills-chart", "figure"),
+         Output("wm-recon-chart", "figure"),
+         Output("wm-reward-chart", "figure"),
+         Output("wm-kl-chart", "figure"),
+         Output("dream-score-chart", "figure")],
         [Input("refresh", "n_intervals")]
     )
     def update_charts(_):
@@ -124,11 +153,11 @@ def create_dashboard(log_dir: str | Path) -> Dash:
             available_tags = ea.Tags().get("scalars", [])
         except Exception as e:
             msg = f"Error loading logs: {e}"
-            return msg, empty, empty, empty, empty, empty, empty
+            return msg, empty, empty, empty, empty, empty, empty, empty, empty, empty, empty
 
         if not available_tags:
             msg = "Waiting for training data..."
-            return msg, empty, empty, empty, empty, empty, empty
+            return msg, empty, empty, empty, empty, empty, empty, empty, empty, empty, empty
 
         # --- Summary stats ---
         summary_parts = []
@@ -226,6 +255,76 @@ def create_dashboard(log_dir: str | Path) -> Dash:
                              template="plotly_dark",
                              xaxis_title="Update", yaxis_title="Ghosts Eaten")
 
-        return summary, score_fig, clear_fig, loss_fig, ep_fig, tp_fig, gk_fig
+        # --- World Model: Reconstruction loss ---
+        wm_recon_fig = go.Figure()
+        steps, vals = _load_scalars(log_dir, "world_model/recon_loss")
+        if vals:
+            wm_recon_fig.add_trace(go.Scatter(
+                x=steps, y=vals, name="Recon Loss",
+                line=dict(color="#BB86FC", width=1), opacity=0.4,
+            ))
+            rolling = _rolling_average(vals, 50)
+            wm_recon_fig.add_trace(go.Scatter(
+                x=steps, y=rolling, name="Rolling Avg",
+                line=dict(color="#BB86FC", width=2),
+            ))
+        wm_recon_fig.update_layout(title="WM Reconstruction Loss",
+                                    template="plotly_dark",
+                                    xaxis_title="Step", yaxis_title="MSE")
+
+        # --- World Model: Reward prediction loss ---
+        wm_reward_fig = go.Figure()
+        steps, vals = _load_scalars(log_dir, "world_model/reward_loss")
+        if vals:
+            wm_reward_fig.add_trace(go.Scatter(
+                x=steps, y=vals, name="Reward Loss",
+                line=dict(color="#03DAC6", width=1), opacity=0.4,
+            ))
+            rolling = _rolling_average(vals, 50)
+            wm_reward_fig.add_trace(go.Scatter(
+                x=steps, y=rolling, name="Rolling Avg",
+                line=dict(color="#03DAC6", width=2),
+            ))
+        wm_reward_fig.update_layout(title="WM Reward Prediction Loss",
+                                     template="plotly_dark",
+                                     xaxis_title="Step", yaxis_title="MSE")
+
+        # --- World Model: KL divergence ---
+        wm_kl_fig = go.Figure()
+        steps, vals = _load_scalars(log_dir, "world_model/kl")
+        if vals:
+            wm_kl_fig.add_trace(go.Scatter(
+                x=steps, y=vals, name="KL Divergence",
+                line=dict(color="#CF6679", width=1), opacity=0.4,
+            ))
+            rolling = _rolling_average(vals, 50)
+            wm_kl_fig.add_trace(go.Scatter(
+                x=steps, y=rolling, name="Rolling Avg",
+                line=dict(color="#CF6679", width=2),
+            ))
+        wm_kl_fig.update_layout(title="WM KL Divergence",
+                                 template="plotly_dark",
+                                 xaxis_title="Step", yaxis_title="KL (nats)")
+
+        # --- Dream Agent: Score vs Real Agent ---
+        dream_fig = go.Figure()
+        steps, vals = _load_scalars(log_dir, "dream/mean_score")
+        if vals:
+            dream_fig.add_trace(go.Scatter(
+                x=steps, y=vals, name="Dream Agent",
+                line=dict(color="#BB86FC", width=2),
+            ))
+        steps, vals = _load_scalars(log_dir, "eval/mean_score")
+        if vals:
+            dream_fig.add_trace(go.Scatter(
+                x=steps, y=[vals[-1]] * len(steps), name="PPO Agent (best)",
+                line=dict(color="#4caf50", width=2, dash="dash"),
+            ))
+        dream_fig.update_layout(title="Dream Agent vs Real Agent Score",
+                                 template="plotly_dark",
+                                 xaxis_title="Update", yaxis_title="Score")
+
+        return (summary, score_fig, clear_fig, loss_fig, ep_fig, tp_fig, gk_fig,
+                wm_recon_fig, wm_reward_fig, wm_kl_fig, dream_fig)
 
     return app

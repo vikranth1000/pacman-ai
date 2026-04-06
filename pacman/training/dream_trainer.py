@@ -121,6 +121,10 @@ class DreamTrainer:
         self.policy = DreamPolicy(latent_dim=self.wm.rssm.latent_dim).to(device)
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
 
+        # Cache starting states to avoid regenerating every update
+        self._cached_starts: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._starts_refresh_every = 50  # regenerate every N updates
+
     # ------------------------------------------------------------------
     # Starting states
     # ------------------------------------------------------------------
@@ -510,8 +514,10 @@ class DreamTrainer:
         print()
 
         for update in range(1, total_updates + 1):
-            # 1. Get diverse starting states
-            start_grids, start_scalars = self._get_starting_states()
+            # 1. Get diverse starting states (cached, refreshed periodically)
+            if self._cached_starts is None or update % self._starts_refresh_every == 1:
+                self._cached_starts = self._get_starting_states()
+            start_grids, start_scalars = self._cached_starts
 
             # 2. Imagine rollout
             rollout = self._imagine_rollout(start_grids, start_scalars)
@@ -532,7 +538,8 @@ class DreamTrainer:
                     f"pg_loss={losses['pg_loss']:.4f} "
                     f"v_loss={losses['value_loss']:.4f} "
                     f"entropy={losses['entropy']:.4f} | "
-                    f"{elapsed:.1f}s"
+                    f"{elapsed:.1f}s",
+                    flush=True,
                 )
 
             # 6. Evaluate in real environment
