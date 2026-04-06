@@ -85,6 +85,63 @@ def _make_small_buffer(config, num_episodes=5, steps_per_ep=50):
     return buf
 
 
+class TestDreamDataCollection:
+    def test_collect_dream_episodes(self, small_wm, config):
+        """Collect episodes using a DreamPolicy + WorldModel in the real env."""
+        device = torch.device("cpu")
+        wm = small_wm
+        wm.eval()
+        for p in wm.parameters():
+            p.requires_grad_(False)
+
+        policy = DreamPolicy(latent_dim=wm.rssm.latent_dim)
+        policy.eval()
+
+        env = PacmanEnv(config, difficulty=0)
+
+        # Collect one episode
+        env.reset(seed=0)
+        obs = env._build_obs()
+
+        h, z = wm.rssm.initial_state(1)
+        h = wm.rssm.dynamics(h, z, torch.zeros(1, dtype=torch.long))
+
+        grids, scalars, actions, rewards, dones = [], [], [], [], []
+        done = False
+        max_steps = 50
+
+        for step in range(max_steps):
+            grid_t = torch.as_tensor(obs["grid"][None])
+            scalars_t = torch.as_tensor(obs["scalars"][None])
+            enc = wm.encoder(grid_t, scalars_t)
+            z, _ = wm.rssm.posterior(h, enc)
+
+            latent = torch.cat([h, z], dim=-1)
+            logits, _ = policy(latent)
+            probs = torch.softmax(logits, dim=-1)
+            action = torch.multinomial(probs, num_samples=1).item()
+
+            grids.append(obs["grid"])
+            scalars.append(obs["scalars"])
+            actions.append(action)
+
+            action_t = torch.tensor([action], dtype=torch.long)
+            h = wm.rssm.dynamics(h, z, action_t)
+
+            _, reward, terminated, truncated, _ = env.step(action)
+            obs = env._build_obs()
+            rewards.append(reward)
+            dones.append(terminated or truncated)
+
+            if terminated or truncated:
+                break
+
+        assert len(grids) > 0
+        assert len(grids) == len(actions) == len(rewards) == len(dones)
+        grid_arr = np.stack(grids)
+        assert grid_arr.shape[1:] == (8, 31, 28)
+
+
 class TestWMTrainerFineTune:
     def test_fine_tune_loads_checkpoint_and_trains(self, config, tmp_path):
         """fine_tune() should load existing WM checkpoint and train with lower LR."""
