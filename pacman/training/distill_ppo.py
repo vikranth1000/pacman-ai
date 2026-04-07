@@ -123,3 +123,122 @@ def collect_distillation_data(
         "latents": torch.cat(all_latents, dim=0),  # (N, 2560)
         "actions": torch.tensor(all_actions, dtype=torch.long),  # (N,)
     }
+
+
+def train_behavioral_cloning(
+    policy: DreamPolicy,
+    latents: torch.Tensor,
+    actions: torch.Tensor,
+    device: torch.device,
+    epochs: int = 50,
+    batch_size: int = 512,
+    lr: float = 1e-3,
+    patience: int = 5,
+    val_fraction: float = 0.2,
+) -> dict:
+    """Train DreamPolicy actor via behavioral cloning on (latent, action) pairs.
+
+    Only trains the actor head. The critic is left untouched.
+
+    Args:
+        policy: DreamPolicy to train (actor head).
+        latents: (N, 2560) latent states.
+        actions: (N,) expert action labels.
+        device: Torch device.
+        epochs: Maximum training epochs.
+        batch_size: Batch size.
+        lr: Initial learning rate.
+        patience: Early stopping patience on val loss.
+        val_fraction: Fraction of data for validation.
+
+    Returns:
+        Dict with train_loss, val_loss, val_accuracy, best_epoch.
+    """
+    policy.to(device)
+    policy.train()
+
+    # Train/val split
+    N = latents.shape[0]
+    n_val = int(N * val_fraction)
+    n_train = N - n_val
+    perm = torch.randperm(N)
+    train_idx, val_idx = perm[:n_train], perm[n_train:]
+
+    train_latents = latents[train_idx].to(device)
+    train_actions = actions[train_idx].to(device)
+    val_latents = latents[val_idx].to(device)
+    val_actions = actions[val_idx].to(device)
+
+    # Only optimize actor parameters (weight decay prevents overfitting)
+    optimizer = torch.optim.Adam(policy.actor.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+
+    best_val_loss = float("inf")
+    best_epoch = 0
+    best_state = None
+    epochs_without_improvement = 0
+
+    for epoch in range(epochs):
+        # --- Training ---
+        policy.train()
+        perm = torch.randperm(n_train, device=device)
+        epoch_loss = 0.0
+        n_batches = 0
+
+        for i in range(0, n_train, batch_size):
+            idx = perm[i : i + batch_size]
+            batch_latents = train_latents[idx]
+            batch_actions = train_actions[idx]
+
+            logits = policy.actor(batch_latents)
+            loss = F.cross_entropy(logits, batch_actions)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        scheduler.step()
+        train_loss = epoch_loss / max(n_batches, 1)
+
+        # --- Validation ---
+        policy.eval()
+        with torch.no_grad():
+            val_logits = policy.actor(val_latents)
+            val_loss = F.cross_entropy(val_logits, val_actions).item()
+            val_preds = val_logits.argmax(dim=-1)
+            val_accuracy = (val_preds == val_actions).float().mean().item()
+
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(
+                f"  Epoch {epoch + 1}/{epochs} | "
+                f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+                f"val_acc={val_accuracy:.1%} lr={scheduler.get_last_lr()[0]:.2e}"
+            )
+
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch + 1
+            best_state = {k: v.cpu().clone() for k, v in policy.actor.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                print(f"  Early stopping at epoch {epoch + 1} (best={best_epoch})")
+                break
+
+    # Restore best weights
+    if best_state is not None:
+        policy.actor.load_state_dict(best_state)
+
+    print(f"  BC complete: best_epoch={best_epoch} val_loss={best_val_loss:.4f} val_acc={val_accuracy:.1%}")
+
+    return {
+        "train_loss": train_loss,
+        "val_loss": best_val_loss,
+        "val_accuracy": val_accuracy,
+        "best_epoch": best_epoch,
+    }

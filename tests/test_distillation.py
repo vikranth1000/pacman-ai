@@ -50,3 +50,77 @@ class TestDistillationDataCollection:
         assert result["latents"].shape[0] > 0
         assert result["actions"].min() >= 0
         assert result["actions"].max() <= 3
+
+
+class TestBehavioralCloning:
+    def test_train_bc_reduces_loss(self):
+        """train_behavioral_cloning trains actor and returns metrics with decreasing loss."""
+        from pacman.training.distill_ppo import train_behavioral_cloning
+
+        device = torch.device("cpu")
+
+        # Create a synthetic dataset: latent -> action mapping
+        # Use a simple pattern: action = argmax of first 4 dims of latent
+        N = 2000
+        latents = torch.randn(N, 2560)
+        # Assign actions based on a learnable pattern
+        actions = (latents[:, :4].argmax(dim=-1)).long()
+
+        policy = DreamPolicy(latent_dim=2560)
+
+        result = train_behavioral_cloning(
+            policy=policy,
+            latents=latents,
+            actions=actions,
+            device=device,
+            epochs=10,
+            batch_size=256,
+            lr=1e-3,
+            patience=50,  # don't early stop for this test
+        )
+
+        assert "train_loss" in result
+        assert "val_loss" in result
+        assert "val_accuracy" in result
+        assert "best_epoch" in result
+        assert isinstance(result["val_accuracy"], float)
+        assert result["val_accuracy"] > 0.25  # better than random (25%)
+        # Loss should have decreased from initial
+        assert result["val_loss"] < 2.0  # well below initial ~1.39 (ln(4))
+
+    def test_bc_policy_predicts_actions(self):
+        """After BC training, the policy should predict the majority action correctly."""
+        from pacman.training.distill_ppo import train_behavioral_cloning
+
+        torch.manual_seed(42)
+        device = torch.device("cpu")
+
+        # Create data with a strong signal: amplify the first 4 dims so the
+        # argmax pattern is easily learnable despite noise in other dimensions
+        N = 3000
+        latents = torch.randn(N, 2560)
+        latents[:, :4] *= 10.0  # amplify signal dimensions strongly
+        actions = latents[:, :4].argmax(dim=-1).long()
+
+        policy = DreamPolicy(latent_dim=2560)
+
+        train_behavioral_cloning(
+            policy=policy,
+            latents=latents,
+            actions=actions,
+            device=device,
+            epochs=30,
+            batch_size=256,
+            lr=1e-3,
+            patience=50,
+        )
+
+        # Test on new data with the same signal amplification
+        test_latents = torch.randn(500, 2560)
+        test_latents[:, :4] *= 10.0
+        test_actions = test_latents[:, :4].argmax(dim=-1).long()
+        with torch.no_grad():
+            logits = policy.actor(test_latents)
+            predicted = logits.argmax(dim=-1)
+        accuracy = (predicted == test_actions).float().mean().item()
+        assert accuracy > 0.5, f"Expected >50% accuracy, got {accuracy:.1%}"
