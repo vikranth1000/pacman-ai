@@ -124,3 +124,65 @@ class TestBehavioralCloning:
             predicted = logits.argmax(dim=-1)
         accuracy = (predicted == test_actions).float().mean().item()
         assert accuracy > 0.5, f"Expected >50% accuracy, got {accuracy:.1%}"
+
+
+class TestDistillationPipeline:
+    def test_distill_and_load_into_dream_policy(self, config):
+        """Full pipeline: collect data, train BC, load result into DreamPolicy."""
+        from pacman.training.distill_ppo import (
+            collect_distillation_data,
+            train_behavioral_cloning,
+        )
+
+        device = torch.device("cpu")
+
+        # Create random PPO network and world model
+        ppo_net = ActorCritic(grid_channels=32, num_scalars=5)
+        ppo_net.eval()
+        wm = WorldModel()
+        wm.eval()
+
+        # Phase 1: Collect data (tiny)
+        data = collect_distillation_data(
+            ppo_network=ppo_net,
+            world_model=wm,
+            config=config,
+            device=device,
+            num_episodes=3,
+            difficulty=0,
+        )
+        assert data["latents"].shape[0] > 50  # some data collected
+
+        # Phase 2: Train BC
+        policy = DreamPolicy(latent_dim=2560)
+        result = train_behavioral_cloning(
+            policy=policy,
+            latents=data["latents"],
+            actions=data["actions"],
+            device=device,
+            epochs=5,
+            batch_size=64,
+            lr=1e-3,
+            patience=50,
+        )
+        assert "val_accuracy" in result
+
+        # Phase 3: Save and reload
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = Path(tmpdir) / "distilled_policy.pt"
+            torch.save({"policy_state_dict": policy.state_dict()}, save_path)
+
+            # Reload into fresh DreamPolicy
+            new_policy = DreamPolicy(latent_dim=2560)
+            ckpt = torch.load(save_path, weights_only=True)
+            new_policy.load_state_dict(ckpt["policy_state_dict"])
+
+            # Verify same output
+            test_input = torch.randn(1, 2560)
+            with torch.no_grad():
+                orig_out = policy.actor(test_input)
+                new_out = new_policy.actor(test_input)
+            assert torch.allclose(orig_out, new_out)
